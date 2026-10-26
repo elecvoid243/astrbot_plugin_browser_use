@@ -1,0 +1,32 @@
+{
+  "python_path": {
+    "type": "string",
+    "default": "",
+    "description": "独立 Python 解释器路径",
+    "hint": "离线完整包留空即可。源码安装时指定已安装 Browser Use 的独立 python.exe，不要填写 AstrBot 自身的解释器。相对路径以插件目录为基准。"
+  },
+  "browser_path": {
+    "type": "string",
+    "default": "",
+    "description": "Chrome / Chromium 可执行文件路径",
+    "hint": "离线完整包留空即可。源码安装时指定完整浏览器目录中的 chrome.exe。"
+  },
+  "headless": {
+    "type": "bool",
+    "default": true,
+    "description": "无界面运行浏览器",
+    "hint": "关闭后可在 Windows 桌面查看浏览器。修改配置后重载插件。"
+  },
+  "allowed_domains": {
+    "type": "list",
+    "default": [],
+    "description": "允许访问的域名",
+    "hint": "空列表不限制导航；可填写 http://127.0.0.1、http*://intranet.example 等 Browser Use 支持的域名模式。此项不代替操作系统的出站网络策略。"
+  },
+  "startup_timeout": {
+    "type": "int",
+    "default": 180,
+    "description": "MCP 启动超时秒数",
+    "hint": "AstrBot MCP 管理器允许的最大值为 300 秒。"
+  }
+}

@@ -1,0 +1,2 @@
+# Browser Use dependencies belong exclusively to runtime/python.
+# The AstrBot host needs no additional packages for this plugin.
