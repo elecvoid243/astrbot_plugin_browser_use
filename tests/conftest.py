@@ -6,9 +6,11 @@ import importlib.util
 import logging
 import sys
 import types
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from starlette.responses import JSONResponse
 
 
 @pytest.fixture
@@ -28,7 +30,14 @@ def plugin_class(monkeypatch, tmp_path):
             self.context = context
             self.logger = logging.getLogger("browser-use-tests")
 
-    for name in ("astrbot", "astrbot.api", "astrbot.api.star"):
+    for name in (
+        "astrbot",
+        "astrbot.api",
+        "astrbot.api.star",
+        "astrbot.core",
+        "astrbot.core.agent",
+        "astrbot.core.agent.mcp_client",
+    ):
         module = types.ModuleType(name)
         monkeypatch.setitem(sys.modules, name, module)
     api = sys.modules["astrbot.api.star"]
@@ -37,6 +46,28 @@ def plugin_class(monkeypatch, tmp_path):
     api.StarTools = types.SimpleNamespace(
         get_data_dir=lambda name: tmp_path / "data" / name
     )
+
+    class MCPTool:
+        def __init__(self, tool, client, server_name):
+            self.mcp_tool = tool
+            self.mcp_client = client
+            self.mcp_server_name = server_name
+
+        async def call(self, context, **kwargs):
+            return await self.mcp_client.call_tool_with_reconnect(
+                tool_name=self.mcp_tool.name,
+                arguments=kwargs,
+                read_timeout_seconds=timedelta(seconds=context.tool_call_timeout),
+            )
+
+    sys.modules["astrbot.core.agent.mcp_client"].MCPTool = MCPTool
+    web = types.ModuleType("astrbot.api.web")
+    web.request = types.SimpleNamespace()
+    web.json_response = lambda data, **kwargs: JSONResponse(data, **kwargs)
+    web.error_response = lambda message, **kwargs: JSONResponse(
+        {"status": "error", "message": message}, **kwargs
+    )
+    monkeypatch.setitem(sys.modules, "astrbot.api.web", web)
     package_name = "browser_use_plugin_under_test"
     package = types.ModuleType(package_name)
     package.__path__ = [str(Path(__file__).resolve().parents[1])]

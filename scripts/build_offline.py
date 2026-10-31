@@ -21,6 +21,8 @@ SOURCE_FILES = (
     "main.py",
     "runtime.py",
     "mcp_entry.py",
+    "observer.py",
+    "owned_tool.py",
     "metadata.yaml",
     "_conf_schema.json",
     "requirements.txt",

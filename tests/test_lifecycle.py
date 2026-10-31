@@ -46,7 +46,10 @@ class Manager:
         )
         self.func_list.extend(
             SimpleNamespace(
-                mcp_server_name=name, mcp_tool=SimpleNamespace(name=tool_name)
+                mcp_server_name=name,
+                mcp_tool=SimpleNamespace(name=tool_name),
+                mcp_client=self.mcp_server_runtime_view[name].client,
+                active=True,
             )
             for tool_name in (
                 "browser_navigate",
@@ -82,7 +85,12 @@ def plugin(plugin_class, tmp_path):
         Plugin instance and its MCP manager.
     """
     manager = Manager()
-    instance = plugin_class(SimpleNamespace(get_llm_tool_manager=lambda: manager), {})
+    instance = plugin_class(
+        SimpleNamespace(
+            get_llm_tool_manager=lambda: manager, register_web_api=lambda *args: None
+        ),
+        {},
+    )
     instance._plugin_dir = tmp_path / "plugin"
     for executable in ("runtime/python/python.exe", "runtime/chromium/chrome.exe"):
         path = instance._plugin_dir / executable

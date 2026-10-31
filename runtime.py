@@ -69,6 +69,7 @@ def build_mcp_config(
                 "default": True,
                 "executable_path": str(executables["browser_path"]),
                 "headless": headless,
+                "viewport": {"width": 1280, "height": 720},
                 "enable_default_extensions": False,
                 "user_data_dir": str(data_dir / "profile"),
                 "downloads_path": str(data_dir / "downloads"),

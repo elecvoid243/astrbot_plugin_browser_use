@@ -59,15 +59,32 @@ python scripts/build_offline.py --source-only
 
 启动期间同步等待 MCP 就绪；失败会回滚本插件创建的服务并显示插件加载错误。插件不会接管同名的外部 MCP，也不会在停止时关闭其他所有服务。
 
-MCP 启动入口只为上游 `BrowserUseServer` 增加退出清理：stdio 断开后关闭活跃浏览器会话。插件停止时还会主动调用 `browser_close_all`，避免浏览器进程随 MCP 连接遗留。
+MCP 启动入口为上游 `BrowserUseServer` 增加会话存储隔离、只读观测桥和退出清理：stdio 断开后关闭活跃浏览器会话。插件停止时还会主动调用 `browser_close_all`，避免浏览器进程随 MCP 连接遗留。
 
 停止时还会在宿主客户端的重连锁内撤销旧连接和启动配置，防止已开始的 Agent 请求持有旧 MCP 工具并在插件禁用后自动拉起进程。此处依赖当前 AstrBot MCPClient 的重连锁与连接配置字段。
 
-浏览器配置、登录状态、下载文件及工作区保存在 AstrBot 管理的 `data/plugin_data/astrbot_plugin_browser_use/`；升级、禁用插件时保留。每次启用会根据当前安装路径重新生成 `browser-use.json`，不要手动编辑该生成文件。
+浏览器配置、下载文件及工作区保存在 AstrBot 管理的 `data/plugin_data/astrbot_plugin_browser_use/`；升级、禁用插件时保留。每次新建浏览器会话使用独立的 profile、下载和工作目录，关闭后重新打开不会继承上一会话的登录态。已有 `profile/` 数据不会被删除或自动分配给新聊天。每次启用会根据当前安装路径重新生成 `browser-use.json`，不要手动编辑该生成文件。
 
 明确指定浏览器路径，关闭默认扩展自动下载、遥测、云同步、版本检查和费用数据获取；不继承模型 API 密钥。不启用 Browser Use 的 `retry_with_browser_use_agent` 和 `browser_extract_content` 工具，其余基础浏览器工具由 AstrBot 主 Agent 使用。
 
-已有 vLLM 的模型仍需支持正常的工具调用；截图理解需要模型支持图像输入。纯文本模型可以使用页面状态和 HTML。Browser Use 的现成 MCP 共用浏览器状态，适合单一受信用户串行使用；本插件没有实现多聊天会话或多账号隔离。配置开关不等同于网络防火墙；严格离线验收应在禁止外网的机器上进行。
+已有 vLLM 的模型仍需支持正常的工具调用；截图理解需要模型支持图像输入。纯文本模型可以使用页面状态和 HTML。浏览器由首次调用工具的聊天独占，同一聊天内的操作串行执行；其他聊天会收到 busy，直到所有者调用 `browser_close_all` 或禁用插件。所有者来自 AstrBot 工具执行上下文，模型参数不能指定所有者。配置开关不等同于网络防火墙；严格离线验收应在禁止外网的机器上进行。
+
+## Agent 浏览器快照与接口契约
+
+在当前聊天的工作区侧栏打开 **Web 预览 → Agent 浏览器**，点击“刷新快照”即可显示 Agent 当前 Chromium 的真实地址、标题、登录态和表单值。原 iframe 入口对应 **Web 预览 → 网页预览**，书签保持原行为。当前切片需要已加载项目才能打开工作区；无项目入口、连续帧和动作时间线由后续切片提供。画面只读，观测图片不会发送给模型，隐藏面板不会停止浏览器。
+
+Dashboard 扩展接口（沿用 AstrBot 登录鉴权）：
+
+- `GET /api/v1/plugins/extensions/browser-use/status?chat_id=<ChatUI session_id>`
+- `GET /api/v1/plugins/extensions/browser-use/snapshot?chat_id=...&generation=...&browser_session_id=...`
+
+两者均检查登录用户是该 WebChat 会话的 `creator`，并检查 `(username, chat_id)` 与工具事件 `webchat!username!chat_id` 的所有者一致。非 WebChat 平台可使用浏览器工具，但当前观测接口只支持 WebChat。未认证为 401，缺少聊天或快照身份为 400，无聊天访问权为 403，忙碌或旧代次/会话为 409，禁用或运行环境不可用为 503。无占用时返回 `available: false`，查询不会启动浏览器。
+
+成功返回 `{status: "ok", data: ...}`。`data` 包括 `generation`（每次 MCP 进程启动的新代次）、`browser_session_id`（实际 BrowserSession ID）、`tab_id`（当前 CDP target）、`sequence`（该代次内递增的快照序号）、`timestamp`（UTC ISO 8601）、`available`、`url`、`title`、`width` 和 `height`。快照另外包含 `image`（base64 JPEG）、`mime_type`。状态查询的尺寸为 0，当前标签不存在时 `tab_id` 为 null。B01 不维护最新图像缓存；状态序号对应最近一次快照。
+
+私有桥只绑定 `127.0.0.1` 的随机端口，使用本次启用的随机 Bearer 凭据和运行代次校验；发现文件仅存放端口和代次。公共响应不包含 CDP 地址或桥接凭据。快照通过 `Page.captureScreenshot` 读取当前视口（1280×720、JPEG quality 65），不调用 DOM 状态刷新或修改 Agent 焦点。标签变化时丢弃该次结果并要求刷新。插件退出时关闭桥并移除其发现文件。
+
+后续实时帧和动作事件应继续使用同一组身份字段；`sequence` 目前只计快照，扩展流事件时需要统一排序。动作字段尚未定义，本切片没有人工接管接口。
 
 ## 验证
 
@@ -80,3 +97,13 @@ python scripts/smoke_test.py --plugin-dir D:/offline/astrbot_plugin_browser_use
 ```
 
 单元测试覆盖启停、重载、启动失败回滚、同名服务保护、关闭失败、并发启停、路径重定位和离线配置。真实浏览器自检使用临时用户目录和 `127.0.0.1` 测试页，不调用 vLLM 或任何云模型。
+
+`tests/test_observation.py` 在本机有完整 Windows runtime 时额外验证真实 Chromium、中文输入、快照、凭据、错误所有者和过期身份；缺少 runtime 时跳过。宿主测试需要 `pytest pytest-asyncio aiohttp fastapi pillow`。可选端到端组件验收还需要宿主 `playwright`（复用随包 Chromium，无需下载浏览器）、Node 和已安装 Dashboard 依赖：
+
+```powershell
+$env:BROWSER_OBSERVER_DASHBOARD_ROOT = 'G:/github/AstrBot_for_spzx/dashboard'
+$env:BROWSER_OBSERVER_EVIDENCE_DIR = 'D:/temporary/observer-evidence'
+python -m pytest tests/test_observation.py -q
+```
+
+此验收以生产 Vue 观测组件、AstrBot 的实际插件请求绑定、隔离的登录身份适配器、插件处理器、私有 MCP 和真实 Chromium 连通测试，输出中英文截图；宿主生命周期、会话数据库和登录身份由测试适配器提供。它不等于完整 AstrBot 登录部署、实际无网目标机或真实 vLLM 联调。
