@@ -171,7 +171,9 @@ class BrowserUsePlugin(Star):
         if not request.username:
             return error_response("Authentication required.", status_code=401)
         if not self._enabled:
-            return error_response("Browser Use is disabled.", status_code=503)
+            return error_response(
+                "Browser Use is disabled.", status_code=503, data={"reason": "disabled"}
+            )
         cid = request.query.get("chat_id", "")
         if not cid:
             return error_response("A chat identity is required.", status_code=400)
@@ -183,9 +185,16 @@ class BrowserUsePlugin(Star):
         ):
             return error_response("Chat access denied.", status_code=403)
         if self._owner is not None and self._webchat_owner != (request.username, cid):
-            return error_response("Browser is busy in another chat.", status_code=409)
+            return error_response(
+                "Browser is busy in another chat.",
+                status_code=409,
+                data={"reason": "busy"},
+            )
         if self._owner is None:
-            return json_response({"status": "ok", "data": {"available": False}})
+            return json_response(
+                {"status": "ok", "data": {"available": False}},
+                headers={"Cache-Control": "no-store"},
+            )
         owner = self._owner
         path = request.path.rsplit("/", 1)[-1]
         if path not in {"snapshot", "stream"}:
@@ -242,7 +251,11 @@ class BrowserUsePlugin(Star):
                 {"status": "ok", "data": state}, headers={"Cache-Control": "no-store"}
             )
         except (OSError, ValueError, aiohttp.ClientError, asyncio.TimeoutError):
-            return error_response("Browser runtime unavailable.", status_code=503)
+            return error_response(
+                "Browser runtime unavailable.",
+                status_code=503,
+                data={"reason": "runtime_unavailable"},
+            )
 
     def browser_stream(
         self, bridge, owner, token, browser_session_id, action_cursor="0"

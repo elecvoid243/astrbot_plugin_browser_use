@@ -69,8 +69,8 @@ def plugin_class(monkeypatch, tmp_path):
     web = types.ModuleType("astrbot.api.web")
     web.request = types.SimpleNamespace()
     web.json_response = lambda data, **kwargs: JSONResponse(data, **kwargs)
-    web.error_response = lambda message, **kwargs: JSONResponse(
-        {"status": "error", "message": message}, **kwargs
+    web.error_response = lambda message, data=None, **kwargs: JSONResponse(
+        {"status": "error", "message": message, "data": data}, **kwargs
     )
     monkeypatch.setitem(sys.modules, "astrbot.api.web", web)
     package_name = "browser_use_plugin_under_test"

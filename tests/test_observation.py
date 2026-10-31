@@ -347,9 +347,11 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
             spec.loader.exec_module(host_web)
             subscriptions = 0
             streams_closed = asyncio.Event()
+            interrupt_stream = asyncio.Event()
+            expire_snapshot = False
 
             async def plugin_http(request):
-                nonlocal subscriptions
+                nonlocal subscriptions, expire_snapshot
                 username = (
                     "alice"
                     if request.headers.get("Authorization")
@@ -378,6 +380,9 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                     await response.prepare(request)
                     try:
                         async for block in result.body_iterator:
+                            if interrupt_stream.is_set():
+                                interrupt_stream.clear()
+                                break
                             await response.write(block)
                     except (ConnectionError, asyncio.CancelledError):
                         pass
@@ -387,6 +392,11 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                         if subscriptions == 0:
                             streams_closed.set()
                     return response
+                if request.path.endswith("/snapshot") and expire_snapshot:
+                    expire_snapshot = False
+                    # Advance the real private action ring after this snapshot.
+                    for _ in range(65):
+                        await tool("browser_get_html")
                 return web.Response(
                     body=result.body,
                     status=result.status_code,
@@ -396,6 +406,33 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
             host = web.Application()
             host.router.add_get(
                 "/api/v1/plugins/extensions/browser-use/{kind}", plugin_http
+            )
+
+            async def spcode_fixture(request):
+                """Supply project metadata for workbench navigation regression.
+
+                Args:
+                    request: Isolated workbench request, never a production project.
+
+                Returns:
+                    Minimal spcode metadata used only by the UI probe.
+                """
+                return web.json_response(
+                    {
+                        "status": "ok",
+                        "data": {
+                            "is_git_repo": True,
+                            "git_available": True,
+                            "directory": "C:/observer-fixture",
+                            "reason": None,
+                            "worktrees": [],
+                            "branches": [],
+                        },
+                    }
+                )
+
+            host.router.add_get(
+                "/api/v1/plugins/extensions/spcode/{kind:.*}", spcode_fixture
             )
             host_runner = web.AppRunner(host)
             await host_runner.setup()
@@ -444,6 +481,7 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                             ),
                         )
                         await ui.goto(url)
+                        await ui.locator(".sp-ghost-btn").click()
                         try:
                             await ui.wait_for_function(
                                 "document.querySelector('.agent-browser-image img')?.naturalWidth === 1280",
@@ -456,6 +494,72 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                         assert (
                             "Same browser 登录态"
                             in await ui.locator(".agent-browser-page").inner_text()
+                        )
+                        # The production workbench opens without a spcode project.
+                        assert (
+                            await ui.locator(".git-diff-sidebar-view-tab").count() == 1
+                        )
+                        lifetime = json.loads((await observe()).body)["data"]
+                        await ui.evaluate("window.observerProbe.setProject(true)")
+                        await ui.wait_for_function(
+                            "document.querySelectorAll('.git-diff-sidebar-view-tab').length === 6"
+                        )
+                        await ui.evaluate("window.observerProbe.setProject(false)")
+                        await ui.locator(".agent-browser-image img").wait_for()
+                        assert await ui.locator(".git-diff-sidebar").count() == 1
+                        # Wrong-chat observation clears pixels, then returning recovers
+                        # the same browser and login, without invoking a browser tool.
+                        await ui.evaluate("window.observerProbe.setChat('chat-2')")
+                        await ui.wait_for_function(
+                            "document.querySelector('.agent-browser-view')?.dataset.connection === 'busy'"
+                        )
+                        assert await ui.locator(".agent-browser-image img").count() == 0
+                        await ui.evaluate("window.observerProbe.setChat('chat-1')")
+                        await ui.wait_for_function(
+                            "document.querySelector('.agent-browser-view')?.dataset.connection === 'live'"
+                        )
+                        await ui.reload()
+                        await ui.locator(".sp-ghost-btn").click()
+                        await ui.wait_for_function(
+                            "document.querySelector('.agent-browser-view')?.dataset.connection === 'live'"
+                        )
+                        expire_snapshot = True
+                        interrupt_stream.set()
+                        await ui.wait_for_function(
+                            "document.querySelector('.agent-browser-view')?.dataset.connection === 'disconnected'"
+                        )
+                        await ui.wait_for_function(
+                            "document.querySelector('.agent-browser-view')?.dataset.connection === 'live'",
+                            timeout=30000,
+                        )
+                        assert (
+                            "已重新同步"
+                            in await ui.locator(".agent-browser-view").inner_text()
+                        )
+                        action_ids = await ui.locator("[data-action-id]").evaluate_all(
+                            "nodes=>nodes.map(node=>node.dataset.actionId)"
+                        )
+                        assert len(action_ids) == len(set(action_ids)) == 32
+                        recovered = json.loads((await observe()).body)["data"]
+                        assert recovered["generation"] == lifetime["generation"]
+                        assert (
+                            recovered["browser_session_id"]
+                            == lifetime["browser_session_id"]
+                        )
+                        assert "Logged in: session=private" in str(
+                            (await tool("browser_get_html")).content
+                        )
+                        await ui.context.set_offline(True)
+                        await ui.wait_for_function(
+                            "document.querySelector('.agent-browser-view')?.dataset.connection === 'disconnected'"
+                        )
+                        assert await ui.locator(".agent-browser-image img").count() == 0
+                        await ui.context.set_offline(False)
+                        await ui.wait_for_function(
+                            "document.querySelector('.agent-browser-view')?.dataset.connection === 'live'"
+                        )
+                        print(
+                            "WORKBENCH_RECOVERY no-project, unload, chat-switch, refresh, EOF, expired-cursor, offline, login passed"
                         )
                         assert (
                             f"http://127.0.0.1:{port}/"
@@ -498,11 +602,14 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                             > 0
                         )
                         if evidence:
+                            await ui.mouse.move(990, 740)
+                            await ui.wait_for_timeout(250)
                             await ui.screenshot(
                                 path=str(destination / "agent-browser-zh.png"),
                                 animations="disabled",
                             )
                             await ui.goto(url + "?locale=en-US")
+                            await ui.locator(".sp-ghost-btn").click()
                             await ui.wait_for_function(
                                 "document.querySelector('.agent-browser-image img')?.naturalWidth === 1280"
                             )
@@ -513,6 +620,8 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                             await ui.locator(".agent-browser-target").wait_for(
                                 timeout=5000
                             )
+                            await ui.mouse.move(990, 740)
+                            await ui.wait_for_timeout(250)
                             await ui.screenshot(
                                 path=str(destination / "agent-browser-en.png"),
                                 animations="disabled",

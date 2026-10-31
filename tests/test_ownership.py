@@ -78,3 +78,52 @@ async def test_trusted_ownership_serialization_and_close(plugin_class):
     plugin._enabled = False
     with pytest.raises(RuntimeError, match="disabled"):
         await tool.call(other)
+
+
+async def test_observation_reports_availability_without_starting_browser(
+    plugin_class, monkeypatch
+):
+    """Expose stable availability reasons without creating a browser.
+
+    Args:
+        plugin_class: Plugin using an isolated host lifecycle adapter.
+        monkeypatch: Cleanup for the authenticated request adapter.
+    """
+    import json
+    import sys
+
+    plugin = plugin_class(
+        SimpleNamespace(
+            get_db=lambda: SimpleNamespace(
+                get_platform_session_by_id=AsyncMock(
+                    return_value=SimpleNamespace(creator="alice", platform_id="webchat")
+                )
+            )
+        ),
+        {},
+    )
+    entry = sys.modules[plugin_class.__module__]
+    monkeypatch.setattr(
+        entry,
+        "request",
+        SimpleNamespace(
+            username="alice", query={"chat_id": "chat-1"}, path="/browser-use/status"
+        ),
+    )
+    disabled = await plugin.browser_observation()
+    assert disabled.status_code == 503
+    assert json.loads(disabled.body)["data"]["reason"] == "disabled"
+    plugin._enabled = True
+    idle = await plugin.browser_observation()
+    assert json.loads(idle.body)["data"] == {"available": False}
+    assert idle.headers["cache-control"] == "no-store"
+    assert plugin._owner is None
+    plugin._owner = "trusted-other"
+    plugin._webchat_owner = ("alice", "other")
+    busy = await plugin.browser_observation()
+    assert busy.status_code == 409
+    assert json.loads(busy.body)["data"]["reason"] == "busy"
+    plugin._webchat_owner = ("alice", "chat-1")
+    unavailable = await plugin.browser_observation()
+    assert unavailable.status_code == 503
+    assert json.loads(unavailable.body)["data"]["reason"] == "runtime_unavailable"

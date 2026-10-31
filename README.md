@@ -71,9 +71,9 @@ MCP 启动入口为上游 `BrowserUseServer` 增加会话存储隔离、只读�
 
 ## Agent 浏览器实时观测与接口契约
 
-在当前聊天的工作区侧栏打开 **Web 预览 → Agent 浏览器**，先显示当前快照，再持续更新 Agent 当前 Chromium 的真实地址、标题、登录态和表单值。标签页会随 Agent 的切换与关闭自动跟随；工具栏显示实时观测状态、当前标签、尺寸和序号。“刷新快照”会重新查询身份并连接观测。原 iframe 入口对应 **Web 预览 → 网页预览**，书签保持原行为。当前切片需要已加载项目才能打开工作区；无项目入口由后续切片提供。动作列表显示正在执行/等待、成功、失败、超时和取消；输入摘要隐藏内容，实际点击/输入位置以短暂圆环标记。画面只读，观测图片不会发送给模型。
+未加载项目时点击输入框上方 **Agent 浏览器**；加载项目后从 **工作区 → Web 预览 → Agent 浏览器** 打开，先显示当前快照，再持续更新 Agent 当前 Chromium 的真实地址、标题、登录态和表单值。标签页会随 Agent 的切换与关闭自动跟随；工具栏显示实时观测状态、当前标签、尺寸和序号。“刷新快照”会重新查询身份并连接观测。原 iframe 入口对应 **Web 预览 → 网页预览**，书签保持原行为。项目卸载不会关闭正在观看的 Agent 浏览器；Git、文件、终端和 iframe 的原入口及书签行为保持。动作列表显示正在执行/等待、成功、失败、超时和取消；输入摘要隐藏内容，实际点击/输入位置以短暂圆环标记。画面只读，观测图片不会发送给模型。
 
-隐藏侧栏、切换工作区标签或将 Dashboard 浏览器页放到后台会断开画面订阅；最后一个观看者离开后停止 screencast，浏览器操作继续。重新打开会读取新快照并恢复连续观测。意外断流显示重连提示，可点击“刷新快照”；自动重连由后续切片提供。
+隐藏侧栏、切换工作区标签或将 Dashboard 浏览器页放到后台会断开画面订阅；最后一个观看者离开后停止 screencast，浏览器操作继续。重新打开会读取新快照并恢复连续观测。意外断流会自动重连（重试间隔逐步增加，最多五秒），也可点击“刷新快照”。空闲状态每三秒查询是否已有浏览器，查询与恢复均不启动浏览器。切换聊天立即取消旧请求、读流和重试并移除旧画面；刷新页面后重新打开侧栏恢复。状态区分空闲、其他聊天占用、插件禁用、运行环境不可用、断开和重连中。
 
 Dashboard 扩展接口（沿用 AstrBot 登录鉴权）：
 
@@ -81,7 +81,7 @@ Dashboard 扩展接口（沿用 AstrBot 登录鉴权）：
 - `GET /api/v1/plugins/extensions/browser-use/snapshot?chat_id=...&generation=...&browser_session_id=...`
 - `GET /api/v1/plugins/extensions/browser-use/stream?chat_id=...&generation=...&browser_session_id=...`
 
-所有接口均检查登录用户是该 WebChat 会话的 `creator`，并检查 `(username, chat_id)` 与工具事件 `webchat!username!chat_id` 的所有者一致。非 WebChat 平台可使用浏览器工具，但当前观测接口只支持 WebChat。未认证为 401，缺少聊天或快照/流身份为 400，无聊天访问权为 403，忙碌或旧代次/会话为 409，禁用或运行环境不可用为 503。无占用时返回 `available: false`，查询不会启动浏览器。流在所有者、浏览器会话或本次启用凭据失效时结束。
+所有接口均检查登录用户是该 WebChat 会话的 `creator`，并检查 `(username, chat_id)` 与工具事件 `webchat!username!chat_id` 的所有者一致。非 WebChat 平台可使用浏览器工具，但当前观测接口只支持 WebChat。未认证为 401，缺少聊天或快照/流身份为 400，无聊天访问权为 403，忙碌或旧代次/会话为 409，禁用或运行环境不可用为 503。无占用时返回 `available: false`，查询不会启动浏览器。禁用、占用和运行环境不可用的错误 envelope 新增 `data.reason`，分别为 `disabled`、`busy` 和 `runtime_unavailable`；HTTP 状态不变。状态与快照响应禁止缓存。流在所有者、浏览器会话或本次启用凭据失效时结束。
 
 状态/快照成功返回 `{status: "ok", data: ...}`。`data` 包括 `generation`（每次 MCP 进程启动的新代次）、`browser_session_id`（实际 BrowserSession ID）、`tab_id`（当前 CDP target）、`sequence`、`timestamp`（UTC ISO 8601）、`available`、`url`、`title`、`width` 和 `height`。快照另外包含 `image`（base64 JPEG）、`mime_type`。状态查询的尺寸为 0，当前标签不存在时 `tab_id` 为 null。
 
@@ -89,7 +89,7 @@ Dashboard 扩展接口（沿用 AstrBot 登录鉴权）：
 
 动作和状态/画面使用同一代次内的 `sequence`。`type: "action"` 表示动作快照变化；所有状态、快照、帧和动作事件均包含 `current_action`（执行中或 null）、`recent_actions`（当前浏览器最多 32 个终态动作）、`action_cursor`（最近动作事件序号）和 `highlight`（有效操作标记或 null）。动作记录包含 `action_id`、可信 `invocation_id`、`generation`、`browser_session_id`、开始时的 `tab_id`、`kind`、`status`、`started_at` 和终态的 `finished_at`（Unix 秒）。`kind` 为 `navigate|click|type|scroll|tab|close|inspect`，`status` 为 `running|succeeded|failed|timed_out|cancelled`。显示摘要由这些枚举翻译产生，不复制工具参数、输入或结果。输入工具本身也使用敏感输入标记，避免上游日志和工具返回重复明文。
 
-连接流时可传 `action_cursor=<最后应用的动作序号>`。运行环境保留最近 128 个动作事件：有效游标先补发当前浏览器的较新动作，再发当前状态；游标为 0 或超出恢复窗口时发 `action_reset: true` 的权威状态快照。超前游标返回 409，格式错误返回 400；不使用 Last-Event-ID。每个观看者在桥接和宿主各保留最多 128 个动作事件，以及独立的最新画面槽；画面不会覆盖动作。动作积压溢出时使用同样的 `action_reset` 快照收敛到有界的最近记录。每次新订阅重启共享 screencast 取得新帧；图像不持久化、不重放历史。B04 可用此契约恢复动作，无需推断连续帧序号。
+连接流时可传 `action_cursor=<最后应用的动作序号>`。运行环境保留最近 128 个动作事件：有效游标先补发当前浏览器的较新动作，再发当前状态；游标为 0 或超出恢复窗口时发 `action_reset: true` 的权威状态快照。超前游标返回 409，格式错误返回 400；不使用 Last-Event-ID。每个观看者在桥接和宿主各保留最多 128 个动作事件，以及独立的最新画面槽；画面不会覆盖动作。动作积压溢出时使用同样的 `action_reset` 快照收敛到有界的最近记录。每次新订阅重启共享 screencast 取得新帧；图像不持久化、不重放历史。Dashboard 每次恢复先查询状态和一致快照，再用快照的 `action_cursor` 订阅增量；不推断连续帧序号、不重放旧图片。重复或较旧序号被丢弃，较旧动作游标不能覆盖当前动作。`action_reset` 或运行代次/浏览器会话改变时显示重新同步提示。连接与延迟回调受当前聊天和请求取消范围约束。
 
 页面额外包含 `document_id`（当前文档的 performance.timeOrigin）、`viewport_width/viewport_height` 和 `scroll_x/scroll_y`。点击/输入完成后，从该次实际执行的上游事件结果提取坐标，不读取或刷新 DOM 索引；若执行没有可靠坐标，只显示摘要。`highlight` 包含这些页面身份、`action_id`、`x/y` 和 `expires_at`，最长显示两秒，按图片对应的视口比例绘制。导航（包括相同 URL 重载）、切页、滚动、视口变化、下一动作和到期都会清除旧标记。取消表示停止等待及后续执行，不撤销已发生的网页操作。
 
@@ -121,4 +121,4 @@ python -m pytest tests/test_observation.py -q
 
 2026-10-31 的本机 Windows x64 验证使用随包 Python 3.13.17、Browser Use 0.13.11、Chrome 156.0.8078.47 和宿主 Python 3.12：动态回环页面连续采样 12 帧 / 3.110 秒，约 3.859 帧/秒，CDP 采集时间到宿主 SSE 消费的最大采样延迟为 92 ms。该短样本不包含前端绘制延迟，不代表稳定帧率承诺。
 
-此验收以生产 Vue 观测组件、AstrBot 的实际插件请求绑定、隔离的登录身份适配器、插件处理器、私有 MCP 和真实 Chromium 连通测试，输出中英文截图；宿主生命周期、会话数据库和登录身份由测试适配器提供。它不等于完整 AstrBot 登录部署、实际无网目标机或真实 vLLM 联调。
+此验收以生产 Vue 工作台入口、侧栏和观测组件、AstrBot 的实际插件请求绑定、隔离的登录身份适配器、插件处理器、私有 MCP 和真实 Chromium 连通测试，覆盖无项目打开、项目卸载、聊天切换、页面刷新、断流、断网与动作缓冲过期，并输出中英文截图；spcode 项目元数据、宿主生命周期、会话数据库和登录身份由测试适配器提供。它不等于完整 AstrBot 登录部署、实际无网目标机或真实 vLLM 联调。
