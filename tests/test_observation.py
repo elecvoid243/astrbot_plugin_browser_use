@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import sys
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from unittest.mock import AsyncMock
 import aiohttp
 import pytest
 from aiohttp import web
+from starlette.responses import StreamingResponse
 
 from runtime import build_mcp_config
 
@@ -47,12 +49,19 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
 
     async def page(request):
         return web.Response(
-            text='<!doctype html><meta charset="utf-8"><title>Same browser 登录态</title><input placeholder="value"><p id="login"></p><script>document.cookie="session=private";document.querySelector("#login").textContent="Logged in: " + document.cookie</script>',
+            text='<!doctype html><meta charset="utf-8"><title>Same browser 登录态</title><input placeholder="value"><p id="login"></p><p id="tick"></p><a target="_blank" href="/second">Second tab</a><div style="height:2500px;background:linear-gradient(white,blue)"></div><script>document.cookie="session=private";document.querySelector("#login").textContent="Logged in: " + document.cookie;let tick=0;setInterval(()=>document.querySelector("#tick").textContent="Live tick " + (++tick),100)</script>',
+            content_type="text/html",
+        )
+
+    async def second(request):
+        return web.Response(
+            text="<title>Second observed tab</title><p>New tab</p><script>setInterval(()=>document.body.style.backgroundColor=`hsl(${Date.now()%360} 80% 70%)`,100)</script>",
             content_type="text/html",
         )
 
     app.router.add_get("/", page)
     app.router.add_get("/check", check_cookie)
+    app.router.add_get("/second", second)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -181,6 +190,100 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
         assert frame["tab_id"] == state["tab_id"]
         assert frame["width"] == 1280 and frame["height"] == 720
         assert len(base64.b64decode(frame["image"])) > 100
+        # Reuse the original DOM index before any subsequent DOM refresh.
+        await tool("browser_type", index=index, text="中文观测验证二")
+        assert (
+            await observe(
+                "stream",
+                generation="old",
+                browser_session_id=state["browser_session_id"],
+            )
+        ).status_code == 409
+        assert (
+            await observe(
+                "stream", generation=state["generation"], browser_session_id="old"
+            )
+        ).status_code == 409
+
+        # Consume production plugin SSE while real MCP actions continue executing.
+        stream_response = await observe("stream", **identity)
+        iterator = stream_response.body_iterator
+        frames = []
+        sequence = frame["sequence"]
+
+        async def next_frame(tab_id=None):
+            nonlocal sequence
+            while True:
+                block = await asyncio.wait_for(anext(iterator), 10)
+                if block.startswith(b":"):
+                    continue
+                event = json.loads(
+                    next(
+                        line[6:]
+                        for line in block.split(b"\n")
+                        if line.startswith(b"data: ")
+                    )
+                )
+                assert event["sequence"] > sequence
+                sequence = event["sequence"]
+                assert event["generation"] == identity["generation"]
+                assert event["browser_session_id"] == identity["browser_session_id"]
+                if event["type"] == "frame" and (
+                    tab_id is None or event["tab_id"] == tab_id
+                ):
+                    assert 0 < event["width"] <= 1280 and 0 < event["height"] <= 720
+                    assert len(base64.b64decode(event["image"])) <= 512 * 1024
+                    event["delivery_latency"] = max(
+                        time.time() - event["capture_timestamp"], 0
+                    )
+                    return event
+
+        try:
+            first = await next_frame(state["tab_id"])
+            started = time.monotonic()
+            for _ in range(12):
+                frames.append(await next_frame(state["tab_id"]))
+            duration = time.monotonic() - started
+            assert len({item["image"] for item in frames}) > 1
+            print(
+                f"OBSERVER_METRICS frames={len(frames)} duration={duration:.3f}s fps={len(frames) / duration:.3f} max_delivery_latency={max(item['delivery_latency'] for item in frames):.3f}s"
+            )
+            await tool("browser_scroll", direction="down")
+            scrolled = await next_frame(state["tab_id"])
+            assert scrolled["image"] != first["image"]
+            await tool("browser_scroll", direction="up")
+            # The existing link opens the same controlled Chromium's new target.
+            elements = json.loads((await tool("browser_get_state")).content[0]["text"])[
+                "interactive_elements"
+            ]
+            link = next(item["index"] for item in elements if item["tag"] == "a")
+            await tool("browser_click", index=link)
+            deadline = time.monotonic() + 5
+            new_tab = None
+            while new_tab is None and time.monotonic() < deadline:
+                tabs = json.loads((await tool("browser_list_tabs")).content[0]["text"])
+                new_tab = next(
+                    (item for item in tabs if item["url"].endswith("/second")), None
+                )
+                if new_tab is None:
+                    await asyncio.sleep(0.1)
+            assert new_tab is not None, tabs
+            await tool("browser_switch_tab", tab_id=new_tab["tab_id"])
+            switched = json.loads((await observe()).body)["data"]
+            newer = await next_frame(switched["tab_id"])
+            assert newer["title"] == "Second observed tab"
+            assert newer["tab_id"] != state["tab_id"]
+            await tool("browser_close_tab", tab_id=new_tab["tab_id"])
+            restored = await next_frame(state["tab_id"])
+            assert restored["title"] == state["title"]
+            # A slow consumer skips obsolete frames, keeping bounded memory.
+            await asyncio.sleep(1.5)
+            latest = await next_frame(state["tab_id"])
+            assert latest["sequence"] > restored["sequence"] + 1
+        finally:
+            await iterator.aclose()
+        # Disconnecting observation leaves browser execution alive.
+        await tool("browser_get_html")
         assert (
             "cdp"
             not in json.dumps(
@@ -208,8 +311,11 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
             )
             host_web = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(host_web)
+            subscriptions = 0
+            streams_closed = asyncio.Event()
 
             async def plugin_http(request):
+                nonlocal subscriptions
                 username = (
                     "alice"
                     if request.headers.get("Authorization")
@@ -229,6 +335,24 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                 monkeypatch.setattr(entry, "request", host_web.request)
                 with host_web.bind_request_context(bound):
                     result = await plugin.browser_observation()
+                if isinstance(result, StreamingResponse):
+                    subscriptions += 1
+                    streams_closed.clear()
+                    response = web.StreamResponse(
+                        status=result.status_code, headers=dict(result.headers)
+                    )
+                    await response.prepare(request)
+                    try:
+                        async for block in result.body_iterator:
+                            await response.write(block)
+                    except (ConnectionError, asyncio.CancelledError):
+                        pass
+                    finally:
+                        await result.body_iterator.aclose()
+                        subscriptions -= 1
+                        if subscriptions == 0:
+                            streams_closed.set()
+                    return response
                 return web.Response(
                     body=result.body,
                     status=result.status_code,
@@ -296,8 +420,33 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                                 f"{browser_errors}; {await ui.locator('body').inner_text()}"
                             ) from exc
                         assert (
-                            await ui.locator(".agent-browser-page").inner_text()
-                            == f"Same browser 登录态\nhttp://127.0.0.1:{port}/"
+                            "Same browser 登录态"
+                            in await ui.locator(".agent-browser-page").inner_text()
+                        )
+                        assert (
+                            f"http://127.0.0.1:{port}/"
+                            in await ui.locator(".agent-browser-page").inner_text()
+                        )
+                        initial_sequence = int(
+                            await ui.locator(".agent-browser-view").get_attribute(
+                                "data-sequence"
+                            )
+                        )
+                        await ui.wait_for_function(
+                            "(sequence) => Number(document.querySelector('.agent-browser-view').dataset.sequence) > sequence + 3",
+                            arg=initial_sequence,
+                        )
+                        await ui.evaluate("window.observerProbe.setVisible(false)")
+                        await asyncio.wait_for(streams_closed.wait(), 5)
+                        assert subscriptions == 0
+                        await tool("browser_scroll", direction="down")
+                        await ui.evaluate("window.observerProbe.setVisible(true)")
+                        await ui.wait_for_function(
+                            "document.querySelector('.agent-browser-image img')?.naturalWidth === 1280"
+                        )
+                        await tool("browser_scroll", direction="up")
+                        await ui.wait_for_function(
+                            "document.querySelector('.agent-browser-status')?.textContent.includes('实时观测')"
                         )
                         if evidence:
                             await ui.screenshot(
@@ -307,6 +456,9 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                             await ui.goto(url + "?locale=en-US")
                             await ui.wait_for_function(
                                 "document.querySelector('.agent-browser-image img')?.naturalWidth === 1280"
+                            )
+                            await ui.wait_for_function(
+                                "document.querySelector('.agent-browser-status')?.textContent.includes('Live')"
                             )
                             await ui.screenshot(
                                 path=str(destination / "agent-browser-en.png"),
@@ -318,8 +470,6 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                 node.kill()
                 await node.wait()
                 await host_runner.cleanup()
-        # Reuse the original element index after observation, proving no DOM rebuild.
-        await tool("browser_type", index=index, text="中文观测验证二")
         html = await tool("browser_get_html")
         assert "Same browser" in str(html.content)
         assert (

@@ -69,22 +69,29 @@ MCP 启动入口为上游 `BrowserUseServer` 增加会话存储隔离、只读�
 
 已有 vLLM 的模型仍需支持正常的工具调用；截图理解需要模型支持图像输入。纯文本模型可以使用页面状态和 HTML。浏览器由首次调用工具的聊天独占，同一聊天内的操作串行执行；其他聊天会收到 busy，直到所有者调用 `browser_close_all` 或禁用插件。所有者来自 AstrBot 工具执行上下文，模型参数不能指定所有者。配置开关不等同于网络防火墙；严格离线验收应在禁止外网的机器上进行。
 
-## Agent 浏览器快照与接口契约
+## Agent 浏览器实时观测与接口契约
 
-在当前聊天的工作区侧栏打开 **Web 预览 → Agent 浏览器**，点击“刷新快照”即可显示 Agent 当前 Chromium 的真实地址、标题、登录态和表单值。原 iframe 入口对应 **Web 预览 → 网页预览**，书签保持原行为。当前切片需要已加载项目才能打开工作区；无项目入口、连续帧和动作时间线由后续切片提供。画面只读，观测图片不会发送给模型，隐藏面板不会停止浏览器。
+在当前聊天的工作区侧栏打开 **Web 预览 → Agent 浏览器**，先显示当前快照，再持续更新 Agent 当前 Chromium 的真实地址、标题、登录态和表单值。标签页会随 Agent 的切换与关闭自动跟随；工具栏显示实时观测状态、当前标签、尺寸和序号。“刷新快照”会重新查询身份并连接观测。原 iframe 入口对应 **Web 预览 → 网页预览**，书签保持原行为。当前切片需要已加载项目才能打开工作区；无项目入口和动作时间线由后续切片提供。画面只读，观测图片不会发送给模型。
+
+隐藏侧栏、切换工作区标签或将 Dashboard 浏览器页放到后台会断开画面订阅；最后一个观看者离开后停止 screencast，浏览器操作继续。重新打开会读取新快照并恢复连续观测。意外断流显示重连提示，可点击“刷新快照”；自动恢复与动作事件回放留给后续切片。
 
 Dashboard 扩展接口（沿用 AstrBot 登录鉴权）：
 
 - `GET /api/v1/plugins/extensions/browser-use/status?chat_id=<ChatUI session_id>`
 - `GET /api/v1/plugins/extensions/browser-use/snapshot?chat_id=...&generation=...&browser_session_id=...`
+- `GET /api/v1/plugins/extensions/browser-use/stream?chat_id=...&generation=...&browser_session_id=...`
 
-两者均检查登录用户是该 WebChat 会话的 `creator`，并检查 `(username, chat_id)` 与工具事件 `webchat!username!chat_id` 的所有者一致。非 WebChat 平台可使用浏览器工具，但当前观测接口只支持 WebChat。未认证为 401，缺少聊天或快照身份为 400，无聊天访问权为 403，忙碌或旧代次/会话为 409，禁用或运行环境不可用为 503。无占用时返回 `available: false`，查询不会启动浏览器。
+所有接口均检查登录用户是该 WebChat 会话的 `creator`，并检查 `(username, chat_id)` 与工具事件 `webchat!username!chat_id` 的所有者一致。非 WebChat 平台可使用浏览器工具，但当前观测接口只支持 WebChat。未认证为 401，缺少聊天或快照/流身份为 400，无聊天访问权为 403，忙碌或旧代次/会话为 409，禁用或运行环境不可用为 503。无占用时返回 `available: false`，查询不会启动浏览器。流在所有者、浏览器会话或本次启用凭据失效时结束。
 
-成功返回 `{status: "ok", data: ...}`。`data` 包括 `generation`（每次 MCP 进程启动的新代次）、`browser_session_id`（实际 BrowserSession ID）、`tab_id`（当前 CDP target）、`sequence`（该代次内递增的快照序号）、`timestamp`（UTC ISO 8601）、`available`、`url`、`title`、`width` 和 `height`。快照另外包含 `image`（base64 JPEG）、`mime_type`。状态查询的尺寸为 0，当前标签不存在时 `tab_id` 为 null。B01 不维护最新图像缓存；状态序号对应最近一次快照。
+状态/快照成功返回 `{status: "ok", data: ...}`。`data` 包括 `generation`（每次 MCP 进程启动的新代次）、`browser_session_id`（实际 BrowserSession ID）、`tab_id`（当前 CDP target）、`sequence`、`timestamp`（UTC ISO 8601）、`available`、`url`、`title`、`width` 和 `height`。快照另外包含 `image`（base64 JPEG）、`mime_type`。状态查询的尺寸为 0，当前标签不存在时 `tab_id` 为 null。
+
+流返回 `text/event-stream`，每块为 `id: <sequence>\ndata: <JSON>\n\n`。JSON 直接携带上述完整身份/页面字段及 `type: "state" | "frame"`，没有状态响应 envelope。`frame` 另带 `image`、`mime_type: "image/jpeg"` 和 `capture_timestamp`（CDP 帧采集的 Unix 秒数）；尺寸是编码图像的实际尺寸。无变化时只发心跳 `: hb\n\n`。`sequence` 在同一代次内统一计数快照和流事件，状态查询只读取最近序号；丢帧、快照和多个订阅者都可能造成序号跳跃，不保证连续。客户端只接收匹配代次/浏览器会话且序号更新的事件；每帧自带标签身份，因此丢失中间状态也可正确跟随。更换标签或 URL 的状态先清空旧图像，旧 CDP session 的帧仍尝试确认，但不发布。
+
+后续 B03 可在同一顺序分配点 `BrowserObserver.publish()` 增加动作事件类型及关联字段；B02 尚未定义动作 payload，也不支持 Last-Event-ID 历史回放。每次新订阅先发当前状态，再重启共享 screencast 取得新帧（静止页面也适用），图像不持久化、不重放历史。后续动作缓冲不能直接复用会丢旧事件的单槽图像队列。
 
 私有桥只绑定 `127.0.0.1` 的随机端口，使用本次启用的随机 Bearer 凭据和运行代次校验；发现文件仅存放端口和代次。公共响应不包含 CDP 地址或桥接凭据。快照通过 `Page.captureScreenshot` 读取当前视口（1280×720、JPEG quality 65），不调用 DOM 状态刷新或修改 Agent 焦点。标签变化时丢弃该次结果并要求刷新。插件退出时关闭桥并移除其发现文件。
 
-后续实时帧和动作事件应继续使用同一组身份字段；`sequence` 目前只计快照，扩展流事件时需要统一排序。动作字段尚未定义，本切片没有人工接管接口。
+实时观测通过同一 BrowserSession 的 `Page.startScreencast` 取帧，JPEG quality 65、最大 1280×720、压缩图片最多 512 KiB、单事件最多 768 KiB；元数据拒绝超过 8192 字符的 URL 或 1024 字符的标题。发布间隔至少 250 ms（最多约 4 Hz，静止页面不强制产生新帧）。采集不调用 `browser_get_state` 或其他 MCP 工具，不刷新 DOM 状态或改变焦点。每个代次最多 4 个订阅，每个订阅在私有桥和宿主代理各保留一个待发事件，慢客户端覆盖旧画面；CDP 确认独立执行并有界。私有桥写入超过 2 秒就关闭该订阅。没有人工接管接口。
 
 ## 验证
 
@@ -98,12 +105,14 @@ python scripts/smoke_test.py --plugin-dir D:/offline/astrbot_plugin_browser_use
 
 单元测试覆盖启停、重载、启动失败回滚、同名服务保护、关闭失败、并发启停、路径重定位和离线配置。真实浏览器自检使用临时用户目录和 `127.0.0.1` 测试页，不调用 vLLM 或任何云模型。
 
-`tests/test_observation.py` 在本机有完整 Windows runtime 时额外验证真实 Chromium、中文输入、快照、凭据、错误所有者和过期身份；缺少 runtime 时跳过。宿主测试需要 `pytest pytest-asyncio aiohttp fastapi pillow`。可选端到端组件验收还需要宿主 `playwright`（复用随包 Chromium，无需下载浏览器）、Node 和已安装 Dashboard 依赖：
+`tests/test_observation.py` 在本机有完整 Windows runtime 时额外验证真实 Chromium、中文输入、快照、连续变化/滚动、标签切换/关闭、慢消费者、凭据、错误所有者和过期身份；缺少 runtime 时跳过。输出 `OBSERVER_METRICS` 记录采样帧率与最大交付延迟。`tests/test_stream.py` 覆盖单槽缓冲和断流/关闭清理。宿主测试需要 `pytest pytest-asyncio aiohttp fastapi pillow`。可选端到端组件验收还需要宿主 `playwright`（复用随包 Chromium，无需下载浏览器）、Node 和已安装 Dashboard 依赖：
 
 ```powershell
 $env:BROWSER_OBSERVER_DASHBOARD_ROOT = 'G:/github/AstrBot_for_spzx/dashboard'
 $env:BROWSER_OBSERVER_EVIDENCE_DIR = 'D:/temporary/observer-evidence'
 python -m pytest tests/test_observation.py -q
 ```
+
+2026-10-31 的本机 Windows x64 验证使用随包 Python 3.13.17、Browser Use 0.13.11、Chrome 156.0.8078.47 和宿主 Python 3.12：动态回环页面连续采样 12 帧 / 3.110 秒，约 3.859 帧/秒，CDP 采集时间到宿主 SSE 消费的最大采样延迟为 92 ms。该短样本不包含前端绘制延迟，不代表稳定帧率承诺。
 
 此验收以生产 Vue 观测组件、AstrBot 的实际插件请求绑定、隔离的登录身份适配器、插件处理器、私有 MCP 和真实 Chromium 连通测试，输出中英文截图；宿主生命周期、会话数据库和登录身份由测试适配器提供。它不等于完整 AstrBot 登录部署、实际无网目标机或真实 vLLM 联调。

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import secrets
 from pathlib import Path
@@ -12,6 +13,7 @@ from uuid import uuid4
 import aiohttp
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.web import error_response, json_response, request
+from starlette.responses import StreamingResponse
 
 from .owned_tool import OwnedBrowserTool
 from .runtime import SERVER_NAME, build_mcp_config
@@ -100,6 +102,12 @@ class BrowserUsePlugin(Star):
                     ["GET"],
                     "Capture the current chat's Agent browser viewport.",
                 )
+                self.context.register_web_api(
+                    "/browser-use/stream",
+                    self.browser_observation,
+                    ["GET"],
+                    "Watch the current chat's Agent browser viewport.",
+                )
             except BaseException:
                 runtime = manager.mcp_server_runtime_view.get(SERVER_NAME)
                 if (
@@ -178,14 +186,18 @@ class BrowserUsePlugin(Star):
         if self._owner is None:
             return json_response({"status": "ok", "data": {"available": False}})
         owner = self._owner
-        path = "snapshot" if request.path.endswith("/snapshot") else "status"
+        path = request.path.rsplit("/", 1)[-1]
+        if path not in {"snapshot", "stream"}:
+            path = "status"
         try:
             if self._bridge_file is None:
                 raise FileNotFoundError
             bridge = json.loads(self._bridge_file.read_text(encoding="utf-8"))
             generation = request.query.get("generation")
             browser_session_id = request.query.get("browser_session_id")
-            if path == "snapshot" and (not generation or not browser_session_id):
+            if path in {"snapshot", "stream"} and (
+                not generation or not browser_session_id
+            ):
                 return error_response("Browser identity is required.", status_code=400)
             if generation is not None and generation != bridge["generation"]:
                 return error_response("Browser generation expired.", status_code=409)
@@ -193,7 +205,7 @@ class BrowserUsePlugin(Star):
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as client:
                 async with client.get(
-                    f"http://127.0.0.1:{int(bridge['port'])}/{path}",
+                    f"http://127.0.0.1:{int(bridge['port'])}/{'status' if path == 'stream' else path}",
                     params={"generation": bridge["generation"]},
                     headers={"Authorization": f"Bearer {self._bridge_token}"},
                 ) as response:
@@ -210,8 +222,126 @@ class BrowserUsePlugin(Star):
                 and browser_session_id != state["browser_session_id"]
             ):
                 return error_response("Browser session expired.", status_code=409)
+            if path == "stream":
+                # Request-bound values must be captured before the generator runs.
+                return self.browser_stream(
+                    bridge, owner, self._bridge_token, browser_session_id
+                )
             return json_response(
                 {"status": "ok", "data": state}, headers={"Cache-Control": "no-store"}
             )
         except (OSError, ValueError, aiohttp.ClientError, asyncio.TimeoutError):
             return error_response("Browser runtime unavailable.", status_code=503)
+
+    def browser_stream(self, bridge, owner, token, browser_session_id):
+        """Proxy bounded SSE while continuously checking the admitted owner.
+
+        Args:
+            bridge: Validated loopback endpoint and runtime generation.
+            owner: Trusted owner admitted by the HTTP request.
+            token: Credential for this plugin activation only.
+            browser_session_id: Validated browser lifetime identity.
+
+        Returns:
+            A streaming response whose cancellation closes its private subscription.
+        """
+
+        async def events():
+            """Yield admitted observations and cancel the private reader on exit.
+
+            Yields:
+                SSE blocks or idle heartbeats for this browser lifetime only.
+            """
+            queue = asyncio.Queue(maxsize=1)
+
+            async def receive():
+                """Read independently of downstream backpressure into one slot."""
+                try:
+                    async with aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(
+                            total=None, sock_connect=5, sock_read=5
+                        ),
+                        read_bufsize=768 * 1024,
+                    ) as client:
+                        async with client.get(
+                            f"http://127.0.0.1:{int(bridge['port'])}/stream",
+                            params={
+                                "generation": bridge["generation"],
+                                "browser_session_id": browser_session_id,
+                            },
+                            headers={"Authorization": f"Bearer {token}"},
+                        ) as response:
+                            response.raise_for_status()
+                            buffer = b""
+                            async for chunk in response.content.iter_any():
+                                buffer += chunk
+                                while b"\n\n" in buffer:
+                                    block, buffer = buffer.split(b"\n\n", 1)
+                                    if len(block) > 768 * 1024:
+                                        raise ValueError(
+                                            "Browser stream event is too large."
+                                        )
+                                    if block.startswith(b":"):
+                                        continue
+                                    payload = next(
+                                        line[6:]
+                                        for line in block.split(b"\n")
+                                        if line.startswith(b"data: ")
+                                    )
+                                    event = json.loads(payload)
+                                    if (
+                                        event.get("generation") != bridge["generation"]
+                                        or event.get("browser_session_id")
+                                        != browser_session_id
+                                    ):
+                                        raise ValueError(
+                                            "Browser stream identity expired."
+                                        )
+                                    if queue.full():
+                                        queue.get_nowait()
+                                    queue.put_nowait(block + b"\n\n")
+                                if len(buffer) > 768 * 1024:
+                                    raise ValueError(
+                                        "Browser stream event is too large."
+                                    )
+                finally:
+                    if queue.full():
+                        queue.get_nowait()
+                    queue.put_nowait(None)
+
+            reader = asyncio.create_task(receive())
+            try:
+                while (
+                    self._enabled
+                    and self._owner == owner
+                    and self._bridge_token == token
+                ):
+                    try:
+                        block = await asyncio.wait_for(queue.get(), timeout=1)
+                    except asyncio.TimeoutError:
+                        block = b": hb\n\n"
+                    if block is None:
+                        break
+                    # Ownership can change while awaiting the next private event.
+                    if (
+                        not self._enabled
+                        or self._owner != owner
+                        or self._bridge_token != token
+                    ):
+                        break
+                    yield block
+            finally:
+                reader.cancel()
+                with contextlib.suppress(
+                    asyncio.CancelledError,
+                    aiohttp.ClientError,
+                    asyncio.TimeoutError,
+                    ValueError,
+                ):
+                    await reader
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
