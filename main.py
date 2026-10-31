@@ -15,6 +15,7 @@ from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.web import error_response, json_response, request
 from starlette.responses import StreamingResponse
 
+from .observation_queue import ObservationQueue
 from .owned_tool import OwnedBrowserTool
 from .runtime import SERVER_NAME, build_mcp_config
 
@@ -223,9 +224,19 @@ class BrowserUsePlugin(Star):
             ):
                 return error_response("Browser session expired.", status_code=409)
             if path == "stream":
+                try:
+                    action_cursor = int(request.query.get("action_cursor", "0"))
+                except ValueError:
+                    return error_response("Invalid action cursor.", status_code=400)
+                if action_cursor < 0 or action_cursor > state["sequence"]:
+                    return error_response("Action cursor expired.", status_code=409)
                 # Request-bound values must be captured before the generator runs.
                 return self.browser_stream(
-                    bridge, owner, self._bridge_token, browser_session_id
+                    bridge,
+                    owner,
+                    self._bridge_token,
+                    browser_session_id,
+                    str(action_cursor),
                 )
             return json_response(
                 {"status": "ok", "data": state}, headers={"Cache-Control": "no-store"}
@@ -233,7 +244,9 @@ class BrowserUsePlugin(Star):
         except (OSError, ValueError, aiohttp.ClientError, asyncio.TimeoutError):
             return error_response("Browser runtime unavailable.", status_code=503)
 
-    def browser_stream(self, bridge, owner, token, browser_session_id):
+    def browser_stream(
+        self, bridge, owner, token, browser_session_id, action_cursor="0"
+    ):
         """Proxy bounded SSE while continuously checking the admitted owner.
 
         Args:
@@ -241,6 +254,7 @@ class BrowserUsePlugin(Star):
             owner: Trusted owner admitted by the HTTP request.
             token: Credential for this plugin activation only.
             browser_session_id: Validated browser lifetime identity.
+            action_cursor: Last applied action sequence for bounded recovery.
 
         Returns:
             A streaming response whose cancellation closes its private subscription.
@@ -252,7 +266,7 @@ class BrowserUsePlugin(Star):
             Yields:
                 SSE blocks or idle heartbeats for this browser lifetime only.
             """
-            queue = asyncio.Queue(maxsize=1)
+            queue = ObservationQueue()
 
             async def receive():
                 """Read independently of downstream backpressure into one slot."""
@@ -268,6 +282,7 @@ class BrowserUsePlugin(Star):
                             params={
                                 "generation": bridge["generation"],
                                 "browser_session_id": browser_session_id,
+                                "action_cursor": action_cursor,
                             },
                             headers={"Authorization": f"Bearer {token}"},
                         ) as response:
@@ -297,16 +312,12 @@ class BrowserUsePlugin(Star):
                                         raise ValueError(
                                             "Browser stream identity expired."
                                         )
-                                    if queue.full():
-                                        queue.get_nowait()
-                                    queue.put_nowait(block + b"\n\n")
+                                    queue.put_nowait(event)
                                 if len(buffer) > 768 * 1024:
                                     raise ValueError(
                                         "Browser stream event is too large."
                                     )
                 finally:
-                    if queue.full():
-                        queue.get_nowait()
                     queue.put_nowait(None)
 
             reader = asyncio.create_task(receive())
@@ -317,10 +328,11 @@ class BrowserUsePlugin(Star):
                     and self._bridge_token == token
                 ):
                     try:
-                        block = await asyncio.wait_for(queue.get(), timeout=1)
+                        event = await asyncio.wait_for(queue.get(), timeout=1)
                     except asyncio.TimeoutError:
-                        block = b": hb\n\n"
-                    if block is None:
+                        yield b": hb\n\n"
+                        continue
+                    if event is None:
                         break
                     # Ownership can change while awaiting the next private event.
                     if (
@@ -329,7 +341,7 @@ class BrowserUsePlugin(Star):
                         or self._bridge_token != token
                     ):
                         break
-                    yield block
+                    yield f"id: {event['sequence']}\ndata: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
             finally:
                 reader.cancel()
                 with contextlib.suppress(

@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+from uuid import uuid4
+
+import aiohttp
 from astrbot.core.agent.mcp_client import MCPTool
+from astrbot.core.agent.tool import current_tool_invocation
 
 
 class OwnedBrowserTool(MCPTool):
@@ -56,7 +62,55 @@ class OwnedBrowserTool(MCPTool):
                 raise RuntimeError("Browser Use is disabled.")
             if plugin._owner != owner:
                 raise RuntimeError("Browser ownership expired; retry from this chat.")
-            result = await super().call(context, **kwargs)
+            action_id = uuid4().hex
+            activation_token = plugin._bridge_token
+            bridge = None
+            if plugin._bridge_file is not None:
+                bridge = json.loads(plugin._bridge_file.read_text(encoding="utf-8"))
+            try:
+                # Reserved metadata is overwritten after model argument expansion.
+                result = await super().call(
+                    context,
+                    **{
+                        **kwargs,
+                        "_astrbot_action": {
+                            "action_id": action_id,
+                            "invocation_id": current_tool_invocation.get(),
+                            "timeout": max(0.01, context.tool_call_timeout * 0.95),
+                        },
+                    },
+                )
+            except BaseException as exc:
+                # MCP cancellation can arrive after its execution response is lost.
+                # Reconcile using the captured activation, never a restarted bridge.
+                if bridge is not None:
+                    try:
+                        async with aiohttp.ClientSession(
+                            timeout=aiohttp.ClientTimeout(total=3)
+                        ) as client:
+                            async with client.post(
+                                f"http://127.0.0.1:{int(bridge['port'])}/action/cancel",
+                                headers={"Authorization": f"Bearer {activation_token}"},
+                                json={
+                                    "generation": bridge["generation"],
+                                    "action_id": action_id,
+                                    "status": "cancelled"
+                                    if isinstance(exc, asyncio.CancelledError)
+                                    else "timed_out"
+                                    if isinstance(exc, asyncio.TimeoutError)
+                                    or getattr(
+                                        getattr(exc, "error", None), "code", None
+                                    )
+                                    == 408
+                                    else "failed",
+                                },
+                            ) as response:
+                                response.raise_for_status()
+                    except Exception:
+                        plugin.logger.warning(
+                            "Browser action reconciliation unavailable."
+                        )
+                raise
             # Closing the entire browser is the explicit ownership handoff.
             if self.mcp_tool.name == "browser_close_all" and not result.isError:
                 plugin._owner = None

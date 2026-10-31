@@ -12,6 +12,7 @@ import aiohttp
 import pytest
 from PIL import Image
 
+from observation_queue import ObservationQueue
 from observer import BrowserObserver
 
 
@@ -54,7 +55,7 @@ async def test_delayed_cdp_frame_is_acknowledged_but_not_published(
         "title": "Current",
     }
     observer.read_state = AsyncMock(return_value=(browser, cdp, state))
-    queue = asyncio.Queue(maxsize=1)
+    queue = ObservationQueue()
     observer.subscribers.add(queue)
     capture = asyncio.create_task(observer.capture())
     try:
@@ -83,7 +84,7 @@ async def test_delayed_cdp_frame_is_acknowledged_but_not_published(
             await capture
 
 
-def test_slow_subscriber_keeps_only_latest_event(monkeypatch, tmp_path):
+async def test_slow_subscriber_keeps_only_latest_event(monkeypatch, tmp_path):
     """A blocked subscriber cannot retain obsolete frames or block other viewers.
 
     Args:
@@ -93,16 +94,16 @@ def test_slow_subscriber_keeps_only_latest_event(monkeypatch, tmp_path):
     monkeypatch.setenv("ASTRBOT_BROWSER_BRIDGE_TOKEN", "secret")
     monkeypatch.setenv("ASTRBOT_BROWSER_BRIDGE_FILE", str(tmp_path / "bridge.json"))
     observer = BrowserObserver(SimpleNamespace(browser_session=None))
-    slow = asyncio.Queue(maxsize=1)
-    fast = asyncio.Queue(maxsize=1)
+    slow = ObservationQueue()
+    fast = ObservationQueue()
     observer.subscribers.update((slow, fast))
     for index in range(1000):
         event = observer.publish(
             "frame", {"browser_session_id": "browser", "image": str(index)}
         )
-        assert fast.get_nowait() == event
-    assert slow.qsize() == 1
-    assert slow.get_nowait()["sequence"] == 1000
+        assert await fast.get() == event
+    assert not slow.actions
+    assert (await slow.get())["sequence"] == 1000
 
 
 @pytest.mark.parametrize("close_bridge", [False, True])

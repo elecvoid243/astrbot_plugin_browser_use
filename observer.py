@@ -10,12 +10,15 @@ import io
 import json
 import os
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
 from aiohttp import web
 from PIL import Image
+
+from observation_queue import ACTION_LIMIT, ObservationQueue
 
 MAX_IMAGE_BYTES = 512 * 1024
 MAX_EVENT_BYTES = 768 * 1024
@@ -42,6 +45,13 @@ class BrowserObserver:
         self._stream_lock = asyncio.Lock()
         self._closed = False
         self._refresh_stream = False
+        self.current_action = None
+        self.recent_actions = deque(maxlen=32)
+        self.action_events = deque(maxlen=ACTION_LIMIT)
+        self.action_cursor = 0
+        self.action_task = None
+        self.cancelled_actions = deque(maxlen=ACTION_LIMIT)
+        self.highlight = None
 
     async def start(self) -> None:
         """Bind an ephemeral loopback port and publish its discovery record.
@@ -53,6 +63,7 @@ class BrowserObserver:
         app.router.add_get("/status", self.observe)
         app.router.add_get("/snapshot", self.observe)
         app.router.add_get("/stream", self.stream)
+        app.router.add_post("/action/cancel", self.cancel_action)
         self.runner = web.AppRunner(app, access_log=None)
         await self.runner.setup()
         site = web.TCPSite(self.runner, "127.0.0.1", 0)
@@ -85,6 +96,7 @@ class BrowserObserver:
             "title": "",
             "width": 0,
             "height": 0,
+            **self.action_state(browser.id if browser else None),
         }
         if browser is None or not browser.agent_focus_target_id:
             return browser, None, state
@@ -92,7 +104,7 @@ class BrowserObserver:
         cdp = await browser.get_or_create_cdp_session(target_id=target, focus=False)
         info = await cdp.cdp_client.send.Runtime.evaluate(
             params={
-                "expression": "JSON.stringify({url:location.href,title:document.title})",
+                "expression": "JSON.stringify({url:location.href,title:document.title,document_id:String(performance.timeOrigin),viewport_width:innerWidth,viewport_height:innerHeight,scroll_x:scrollX,scroll_y:scrollY})",
                 "returnByValue": True,
             },
             session_id=cdp.session_id,
@@ -103,28 +115,133 @@ class BrowserObserver:
                 max_size=8192, actual_size=len(state["url"]) + len(state["title"])
             )
         state["tab_id"] = target
+        if self.highlight and any(
+            self.highlight.get(key) != state.get(key)
+            for key in (
+                "browser_session_id",
+                "tab_id",
+                "document_id",
+                "url",
+                "viewport_width",
+                "viewport_height",
+                "scroll_x",
+                "scroll_y",
+            )
+        ):
+            self.highlight = None
         if (
             self.server.browser_session is not browser
             or browser.agent_focus_target_id != target
         ):
             raise web.HTTPConflict(text="Browser target changed; refresh observation.")
+        state.update(self.action_state(browser.id))
         return browser, cdp, state
+
+    def action_state(self, session_id):
+        """Read a bounded action snapshot scoped to one browser lifetime.
+
+        Args:
+            session_id: Actual BrowserSession ID, never a model parameter.
+
+        Returns:
+            Current action, recent terminal actions, cursor and optional marker.
+        """
+        if self.current_action and self.current_action["browser_session_id"] is None:
+            self.current_action["browser_session_id"] = session_id
+        current = self.current_action
+        return {
+            "current_action": dict(current)
+            if current and current["browser_session_id"] == session_id
+            else None,
+            "recent_actions": [
+                dict(item)
+                for item in self.recent_actions
+                if item["browser_session_id"] == session_id
+            ],
+            "action_cursor": self.action_cursor,
+            "highlight": self.highlight
+            if self.highlight
+            and self.highlight["browser_session_id"] == session_id
+            and self.highlight["expires_at"] > time.time()
+            else None,
+        }
+
+    async def action_changed(self):
+        """Publish an authoritative action snapshot even during CDP failure."""
+        try:
+            _, _, state = await asyncio.wait_for(self.read_state(), 2)
+        except Exception:
+            browser = self.server.browser_session
+            state = {
+                "generation": self.generation,
+                "browser_session_id": browser.id if browser else None,
+                "tab_id": None,
+                "available": browser is not None,
+                "url": "",
+                "title": "",
+                "width": 0,
+                "height": 0,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        self.action_cursor = self.sequence + 1
+        state.update(self.action_state(state["browser_session_id"]))
+        event = self.publish("action", state)
+        self.action_events.append(event)
+
+    async def cancel_action(self, request):
+        """Reconcile a host timeout/cancellation without trusting public clients.
+
+        Args:
+            request: Credential-protected, generation-bound internal request.
+
+        Returns:
+            Acknowledgement after the matching action reaches a terminal state.
+        """
+        if not hmac.compare_digest(
+            request.headers.get("Authorization", ""), f"Bearer {self.token}"
+        ):
+            raise web.HTTPUnauthorized()
+        body = await request.json()
+        if body.get("generation") != self.generation:
+            raise web.HTTPConflict()
+        action_id = body.get("action_id")
+        self.cancelled_actions.append(action_id)
+        if self.current_action and self.current_action["action_id"] == action_id:
+            action = self.current_action
+            self.current_action = None
+            self.highlight = None
+            self.recent_actions.append(
+                {
+                    **action,
+                    "status": body.get("status")
+                    if body.get("status") in {"failed", "timed_out", "cancelled"}
+                    else "cancelled",
+                    "finished_at": time.time(),
+                }
+            )
+            if self.action_task:
+                self.action_task.cancel()
+            await self.action_changed()
+        return web.json_response({"ok": True})
 
     def publish(self, kind: str, state: dict) -> dict:
         """Order observations and replace each subscriber's pending event.
 
         Args:
-            kind: Event discriminator, currently state, frame, or error.
+            kind: Event discriminator: state, frame, action, or error.
             state: Self-contained browser identity and observation payload.
 
         Returns:
             The ordered event, shared by bounded subscriber queues.
         """
         self.sequence += 1
-        event = {**state, "type": kind, "sequence": self.sequence}
+        event = {
+            **state,
+            **self.action_state(state.get("browser_session_id")),
+            "type": kind,
+            "sequence": self.sequence,
+        }
         for queue in self.subscribers:
-            if queue.full():
-                queue.get_nowait()
             queue.put_nowait(event)
         return event
 
@@ -158,14 +275,22 @@ class BrowserObserver:
             )
             after = await cdp.cdp_client.send.Runtime.evaluate(
                 params={
-                    "expression": "JSON.stringify({url:location.href,title:document.title})",
+                    "expression": "JSON.stringify({url:location.href,title:document.title,document_id:String(performance.timeOrigin),viewport_width:innerWidth,viewport_height:innerHeight,scroll_x:scrollX,scroll_y:scrollY})",
                     "returnByValue": True,
                 },
                 session_id=cdp.session_id,
             )
             if json.loads(after["result"]["value"]) != {
-                "url": state["url"],
-                "title": state["title"],
+                key: state[key]
+                for key in (
+                    "url",
+                    "title",
+                    "document_id",
+                    "viewport_width",
+                    "viewport_height",
+                    "scroll_x",
+                    "scroll_y",
+                )
             }:
                 raise web.HTTPConflict(text="Page changed; refresh observation.")
             raw = base64.b64decode(shot["data"])
@@ -185,6 +310,7 @@ class BrowserObserver:
             or browser.agent_focus_target_id != target
         ):
             raise web.HTTPConflict(text="Browser target changed; refresh observation.")
+        state.update(self.action_state(state["browser_session_id"]))
         return web.json_response(state, headers={"Cache-Control": "no-store"})
 
     async def stream(self, request: web.Request) -> web.StreamResponse:
@@ -205,11 +331,27 @@ class BrowserObserver:
         browser, _, state = await self.read_state()
         if browser is None or request.query.get("browser_session_id") != browser.id:
             raise web.HTTPConflict(text="Browser session expired.")
-        queue = asyncio.Queue(maxsize=1)
+        queue = ObservationQueue()
+        try:
+            cursor = int(request.query.get("action_cursor", "0"))
+        except ValueError:
+            raise web.HTTPBadRequest(text="Invalid action cursor.") from None
+        if cursor < 0 or cursor > self.sequence:
+            raise web.HTTPConflict(text="Action cursor expired.")
         async with self._stream_lock:
             if len(self.subscribers) >= 4:
                 raise web.HTTPTooManyRequests()
             self.subscribers.add(queue)
+            retained = list(self.action_events)
+            if cursor and retained and cursor >= retained[0]["sequence"] - 1:
+                for event in retained:
+                    if (
+                        event["sequence"] > cursor
+                        and event["browser_session_id"] == browser.id
+                    ):
+                        queue.put_nowait(event)
+            else:
+                state["action_reset"] = True
             if self._producer is None:
                 self._producer = asyncio.create_task(self.capture())
             self.publish("state", state)
@@ -320,7 +462,10 @@ class BrowserObserver:
                         or active[0] is not browser
                         or active[2] != target
                     )
-                    navigated = metadata is not None and metadata["url"] != state["url"]
+                    navigated = metadata is not None and (
+                        metadata["url"] != state["url"]
+                        or metadata.get("document_id") != state.get("document_id")
+                    )
                     if changed or navigated or overflow:
                         self._refresh_stream = False
                         if active is not None:

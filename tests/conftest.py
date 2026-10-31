@@ -6,6 +6,7 @@ import importlib.util
 import logging
 import sys
 import types
+from contextvars import ContextVar
 from datetime import timedelta
 from pathlib import Path
 
@@ -37,6 +38,7 @@ def plugin_class(monkeypatch, tmp_path):
         "astrbot.core",
         "astrbot.core.agent",
         "astrbot.core.agent.mcp_client",
+        "astrbot.core.agent.tool",
     ):
         module = types.ModuleType(name)
         monkeypatch.setitem(sys.modules, name, module)
@@ -61,6 +63,9 @@ def plugin_class(monkeypatch, tmp_path):
             )
 
     sys.modules["astrbot.core.agent.mcp_client"].MCPTool = MCPTool
+    sys.modules["astrbot.core.agent.tool"].current_tool_invocation = ContextVar(
+        "invocation", default=None
+    )
     web = types.ModuleType("astrbot.api.web")
     web.request = types.SimpleNamespace()
     web.json_response = lambda data, **kwargs: JSONResponse(data, **kwargs)

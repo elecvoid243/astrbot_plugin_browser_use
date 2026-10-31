@@ -71,9 +71,9 @@ MCP 启动入口为上游 `BrowserUseServer` 增加会话存储隔离、只读�
 
 ## Agent 浏览器实时观测与接口契约
 
-在当前聊天的工作区侧栏打开 **Web 预览 → Agent 浏览器**，先显示当前快照，再持续更新 Agent 当前 Chromium 的真实地址、标题、登录态和表单值。标签页会随 Agent 的切换与关闭自动跟随；工具栏显示实时观测状态、当前标签、尺寸和序号。“刷新快照”会重新查询身份并连接观测。原 iframe 入口对应 **Web 预览 → 网页预览**，书签保持原行为。当前切片需要已加载项目才能打开工作区；无项目入口和动作时间线由后续切片提供。画面只读，观测图片不会发送给模型。
+在当前聊天的工作区侧栏打开 **Web 预览 → Agent 浏览器**，先显示当前快照，再持续更新 Agent 当前 Chromium 的真实地址、标题、登录态和表单值。标签页会随 Agent 的切换与关闭自动跟随；工具栏显示实时观测状态、当前标签、尺寸和序号。“刷新快照”会重新查询身份并连接观测。原 iframe 入口对应 **Web 预览 → 网页预览**，书签保持原行为。当前切片需要已加载项目才能打开工作区；无项目入口由后续切片提供。动作列表显示正在执行/等待、成功、失败、超时和取消；输入摘要隐藏内容，实际点击/输入位置以短暂圆环标记。画面只读，观测图片不会发送给模型。
 
-隐藏侧栏、切换工作区标签或将 Dashboard 浏览器页放到后台会断开画面订阅；最后一个观看者离开后停止 screencast，浏览器操作继续。重新打开会读取新快照并恢复连续观测。意外断流显示重连提示，可点击“刷新快照”；自动恢复与动作事件回放留给后续切片。
+隐藏侧栏、切换工作区标签或将 Dashboard 浏览器页放到后台会断开画面订阅；最后一个观看者离开后停止 screencast，浏览器操作继续。重新打开会读取新快照并恢复连续观测。意外断流显示重连提示，可点击“刷新快照”；自动重连由后续切片提供。
 
 Dashboard 扩展接口（沿用 AstrBot 登录鉴权）：
 
@@ -85,13 +85,17 @@ Dashboard 扩展接口（沿用 AstrBot 登录鉴权）：
 
 状态/快照成功返回 `{status: "ok", data: ...}`。`data` 包括 `generation`（每次 MCP 进程启动的新代次）、`browser_session_id`（实际 BrowserSession ID）、`tab_id`（当前 CDP target）、`sequence`、`timestamp`（UTC ISO 8601）、`available`、`url`、`title`、`width` 和 `height`。快照另外包含 `image`（base64 JPEG）、`mime_type`。状态查询的尺寸为 0，当前标签不存在时 `tab_id` 为 null。
 
-流返回 `text/event-stream`，每块为 `id: <sequence>\ndata: <JSON>\n\n`。JSON 直接携带上述完整身份/页面字段及 `type: "state" | "frame"`，没有状态响应 envelope。`frame` 另带 `image`、`mime_type: "image/jpeg"` 和 `capture_timestamp`（CDP 帧采集的 Unix 秒数）；尺寸是编码图像的实际尺寸。无变化时只发心跳 `: hb\n\n`。`sequence` 在同一代次内统一计数快照和流事件，状态查询只读取最近序号；丢帧、快照和多个订阅者都可能造成序号跳跃，不保证连续。客户端只接收匹配代次/浏览器会话且序号更新的事件；每帧自带标签身份，因此丢失中间状态也可正确跟随。更换标签或 URL 的状态先清空旧图像，旧 CDP session 的帧仍尝试确认，但不发布。
+流返回 `text/event-stream`，每块为 `id: <sequence>\ndata: <JSON>\n\n`。JSON 直接携带上述完整身份/页面字段及 `type: "state" | "frame" | "action"`，没有状态响应 envelope。`frame` 另带 `image`、`mime_type: "image/jpeg"` 和 `capture_timestamp`（CDP 帧采集的 Unix 秒数）；尺寸是编码图像的实际尺寸。无变化时只发心跳 `: hb\n\n`。`sequence` 在同一代次内统一计数快照和流事件，状态查询只读取最近序号；丢帧、快照和多个订阅者都可能造成序号跳跃，不保证连续。客户端只接收匹配代次/浏览器会话且序号更新的事件；每帧自带标签身份，因此丢失中间状态也可正确跟随。更换标签或 URL 的状态先清空旧图像，旧 CDP session 的帧仍尝试确认，但不发布。
 
-后续 B03 可在同一顺序分配点 `BrowserObserver.publish()` 增加动作事件类型及关联字段；B02 尚未定义动作 payload，也不支持 Last-Event-ID 历史回放。每次新订阅先发当前状态，再重启共享 screencast 取得新帧（静止页面也适用），图像不持久化、不重放历史。后续动作缓冲不能直接复用会丢旧事件的单槽图像队列。
+动作和状态/画面使用同一代次内的 `sequence`。`type: "action"` 表示动作快照变化；所有状态、快照、帧和动作事件均包含 `current_action`（执行中或 null）、`recent_actions`（当前浏览器最多 32 个终态动作）、`action_cursor`（最近动作事件序号）和 `highlight`（有效操作标记或 null）。动作记录包含 `action_id`、可信 `invocation_id`、`generation`、`browser_session_id`、开始时的 `tab_id`、`kind`、`status`、`started_at` 和终态的 `finished_at`（Unix 秒）。`kind` 为 `navigate|click|type|scroll|tab|close|inspect`，`status` 为 `running|succeeded|failed|timed_out|cancelled`。显示摘要由这些枚举翻译产生，不复制工具参数、输入或结果。输入工具本身也使用敏感输入标记，避免上游日志和工具返回重复明文。
+
+连接流时可传 `action_cursor=<最后应用的动作序号>`。运行环境保留最近 128 个动作事件：有效游标先补发当前浏览器的较新动作，再发当前状态；游标为 0 或超出恢复窗口时发 `action_reset: true` 的权威状态快照。超前游标返回 409，格式错误返回 400；不使用 Last-Event-ID。每个观看者在桥接和宿主各保留最多 128 个动作事件，以及独立的最新画面槽；画面不会覆盖动作。动作积压溢出时使用同样的 `action_reset` 快照收敛到有界的最近记录。每次新订阅重启共享 screencast 取得新帧；图像不持久化、不重放历史。B04 可用此契约恢复动作，无需推断连续帧序号。
+
+页面额外包含 `document_id`（当前文档的 performance.timeOrigin）、`viewport_width/viewport_height` 和 `scroll_x/scroll_y`。点击/输入完成后，从该次实际执行的上游事件结果提取坐标，不读取或刷新 DOM 索引；若执行没有可靠坐标，只显示摘要。`highlight` 包含这些页面身份、`action_id`、`x/y` 和 `expires_at`，最长显示两秒，按图片对应的视口比例绘制。导航（包括相同 URL 重载）、切页、滚动、视口变化、下一动作和到期都会清除旧标记。取消表示停止等待及后续执行，不撤销已发生的网页操作。
 
 私有桥只绑定 `127.0.0.1` 的随机端口，使用本次启用的随机 Bearer 凭据和运行代次校验；发现文件仅存放端口和代次。公共响应不包含 CDP 地址或桥接凭据。快照通过 `Page.captureScreenshot` 读取当前视口（1280×720、JPEG quality 65），不调用 DOM 状态刷新或修改 Agent 焦点。标签变化时丢弃该次结果并要求刷新。插件退出时关闭桥并移除其发现文件。
 
-实时观测通过同一 BrowserSession 的 `Page.startScreencast` 取帧，JPEG quality 65、最大 1280×720、压缩图片最多 512 KiB、单事件最多 768 KiB；元数据拒绝超过 8192 字符的 URL 或 1024 字符的标题。发布间隔至少 250 ms（最多约 4 Hz，静止页面不强制产生新帧）。采集不调用 `browser_get_state` 或其他 MCP 工具，不刷新 DOM 状态或改变焦点。每个代次最多 4 个订阅，每个订阅在私有桥和宿主代理各保留一个待发事件，慢客户端覆盖旧画面；CDP 确认独立执行并有界。私有桥写入超过 2 秒就关闭该订阅。没有人工接管接口。
+实时观测通过同一 BrowserSession 的 `Page.startScreencast` 取帧，JPEG quality 65、最大 1280×720、压缩图片最多 512 KiB、单事件最多 768 KiB；元数据拒绝超过 8192 字符的 URL 或 1024 字符的标题。发布间隔至少 250 ms（最多约 4 Hz，静止页面不强制产生新帧）。采集不调用 `browser_get_state` 或其他 MCP 工具，不刷新 DOM 状态或改变焦点。每个代次最多 4 个订阅，每个订阅在私有桥和宿主代理各保留一个待发画面，并为动作保留独立有界缓冲，慢客户端覆盖旧画面；CDP 确认独立执行并有界。私有桥写入超过 2 秒就关闭该订阅。没有人工接管接口。
 
 ## 验证
 

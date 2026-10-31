@@ -42,6 +42,14 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
     )
     app = web.Application()
     cookies_seen = []
+    slow_started = asyncio.Event()
+
+    async def slow_page(request):
+        slow_started.set()
+        await asyncio.sleep(0.5)
+        return web.Response(
+            text="<title>Slow local page</title>", content_type="text/html"
+        )
 
     async def check_cookie(request):
         cookies_seen.append(request.cookies.get("session"))
@@ -62,6 +70,7 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
     app.router.add_get("/", page)
     app.router.add_get("/check", check_cookie)
     app.router.add_get("/second", second)
+    app.router.add_get("/slow", slow_page)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -79,7 +88,7 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
     )
     request_id = 0
 
-    async def rpc(method, params):
+    async def rpc(method, params, allow_error=False):
         nonlocal request_id
         request_id += 1
         process.stdin.write(
@@ -103,7 +112,8 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
             if response.get("id") == request_id:
                 assert "error" not in response, response
                 result = response["result"]
-                assert not result.get("isError"), result
+                if not allow_error:
+                    assert not result.get("isError"), result
                 return result
 
     try:
@@ -133,8 +143,11 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
             result = await rpc(
                 "tools/call",
                 {"name": kwargs["tool_name"], "arguments": kwargs["arguments"]},
+                allow_error=True,
             )
-            return SimpleNamespace(isError=False, content=result["content"])
+            return SimpleNamespace(
+                isError=result.get("isError", False), content=result["content"]
+            )
 
         client = SimpleNamespace(call_tool_with_reconnect=call_tool)
         event = SimpleNamespace(
@@ -147,13 +160,17 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
         )
 
         async def tool(name, **kwargs):
+            allow_error = kwargs.pop("_allow_error", False)
             original = SimpleNamespace(
                 mcp_tool=SimpleNamespace(name=name),
                 mcp_client=client,
                 mcp_server_name="browser-use",
                 active=True,
             )
-            return await OwnedBrowserTool(original, plugin).call(context, **kwargs)
+            result = await OwnedBrowserTool(original, plugin).call(context, **kwargs)
+            if not allow_error:
+                assert not result.isError, result.content
+            return result
 
         await tool("browser_navigate", url=f"http://127.0.0.1:{port}")
         before = await tool("browser_get_state")
@@ -181,6 +198,23 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
         assert (await observe(username="mallory")).status_code == 403
         assert (await observe(chat_id="chat-2")).status_code == 409
         state = json.loads((await observe()).body)["data"]
+        assert state["current_action"] is None
+        assert state["recent_actions"][-1]["kind"] == "type"
+        assert state["recent_actions"][-1]["status"] == "succeeded"
+        assert "中文观测验证" not in json.dumps(state, ensure_ascii=False)
+        assert state["highlight"] is not None, state
+        assert (
+            state["highlight"]["action_id"] == state["recent_actions"][-1]["action_id"]
+        )
+        print("ACTION_TARGET " + json.dumps(state["highlight"]))
+        await tool("browser_click", coordinate_x=96, coordinate_y=22)
+        clicked = json.loads((await observe()).body)["data"]
+        assert clicked["highlight"]["x"] == 96 and clicked["highlight"]["y"] == 22
+        failed = await tool("browser_click", index=999999, _allow_error=True)
+        assert failed.isError
+        failed_state = json.loads((await observe()).body)["data"]
+        assert failed_state["recent_actions"][-1]["status"] == "failed"
+        assert failed_state["highlight"] is None
         assert state["title"] == "Same browser 登录态"
         assert state["url"] == f"http://127.0.0.1:{port}/"
         identity = {key: state[key] for key in ("generation", "browser_session_id")}
@@ -448,6 +482,21 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                         await ui.wait_for_function(
                             "document.querySelector('.agent-browser-status')?.textContent.includes('实时观测')"
                         )
+                        # A real input action must render an actual target marker.
+                        elements = json.loads(
+                            (await tool("browser_get_state")).content[0]["text"]
+                        )["interactive_elements"]
+                        index = next(
+                            item["index"]
+                            for item in elements
+                            if item.get("placeholder") == "value"
+                        )
+                        await tool("browser_type", index=index, text="中文动作验证")
+                        await ui.locator(".agent-browser-target").wait_for(timeout=5000)
+                        assert (
+                            await ui.locator('[data-action-status="succeeded"]').count()
+                            > 0
+                        )
                         if evidence:
                             await ui.screenshot(
                                 path=str(destination / "agent-browser-zh.png"),
@@ -459,6 +508,10 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                             )
                             await ui.wait_for_function(
                                 "document.querySelector('.agent-browser-status')?.textContent.includes('Live')"
+                            )
+                            await tool("browser_type", index=index, text="中文动作验证")
+                            await ui.locator(".agent-browser-target").wait_for(
+                                timeout=5000
                             )
                             await ui.screenshot(
                                 path=str(destination / "agent-browser-en.png"),
@@ -485,6 +538,33 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
             )
         ).status_code == 409
         bridge = json.loads(bridge_file.read_text(encoding="utf-8"))
+        # Real local navigation timeout and host cancellation must finalize once.
+        context.tool_call_timeout = 0.05
+        timed_out = await tool(
+            "browser_navigate", url=f"http://127.0.0.1:{port}/slow", _allow_error=True
+        )
+        assert timed_out.isError
+        timeout_state = json.loads((await observe()).body)["data"]
+        assert timeout_state["current_action"] is None
+        assert timeout_state["recent_actions"][-1]["status"] == "timed_out"
+        context.tool_call_timeout = 60
+        await tool("browser_navigate", url=f"http://127.0.0.1:{port}/")
+        slow_started.clear()
+        cancelled = asyncio.create_task(
+            tool(
+                "browser_navigate",
+                url=f"http://127.0.0.1:{port}/slow",
+                _allow_error=True,
+            )
+        )
+        await asyncio.wait_for(slow_started.wait(), 5)
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        cancelled_state = json.loads((await observe()).body)["data"]
+        assert cancelled_state["current_action"] is None
+        assert cancelled_state["recent_actions"][-1]["status"] == "cancelled"
+        print("ACTION_TERMINALS real click,input,failure,timeout,cancellation passed")
         async with aiohttp.ClientSession() as http:
             async with http.get(
                 f"http://127.0.0.1:{bridge['port']}/snapshot",

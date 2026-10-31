@@ -19,7 +19,14 @@ async def test_trusted_ownership_serialization_and_close(plugin_class):
         nonlocal active
         assert active == 0
         active += 1
-        entered.append(kwargs["arguments"])
+        entered.append(
+            {
+                key: value
+                for key, value in kwargs["arguments"].items()
+                if key != "_astrbot_action"
+            }
+        )
+        assert kwargs["arguments"]["_astrbot_action"]["action_id"] != "forged"
         await asyncio.sleep(0)
         active -= 1
         return SimpleNamespace(isError=False)
@@ -40,7 +47,10 @@ async def test_trusted_ownership_serialization_and_close(plugin_class):
     context = SimpleNamespace(
         context=SimpleNamespace(event=event), tool_call_timeout=30
     )
-    await asyncio.gather(tool.call(context, url="one"), tool.call(context, url="two"))
+    await asyncio.gather(
+        tool.call(context, url="one", _astrbot_action={"action_id": "forged"}),
+        tool.call(context, url="two"),
+    )
     assert entered == [{"url": "one"}, {"url": "two"}]
     assert plugin._webchat_owner == ("alice", "chat-1")
     other = SimpleNamespace(
