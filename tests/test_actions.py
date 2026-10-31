@@ -15,6 +15,125 @@ from observation_queue import ACTION_LIMIT, ObservationQueue
 from observer import BrowserObserver
 
 
+async def test_failed_close_retains_owned_lifetime_for_retry(
+    observed_server, monkeypatch
+):
+    """Preserve identity when upstream loses its pointer after a failed close.
+
+    Args:
+        observed_server: Execution wrapper with a controlled upstream server.
+        monkeypatch: Temporary upstream close implementation.
+    """
+    server, observer, upstream = observed_server
+    browser = server.browser_session
+    server.tools = object()
+    server.active_sessions = {browser.id: {"session": browser}}
+    fail = True
+
+    async def close_all():
+        server.browser_session = None
+        server.tools = None
+        if not fail:
+            server.active_sessions.clear()
+        return "Closed sessions"
+
+    monkeypatch.setattr(
+        type(server).__mro__[1],
+        "_close_all_sessions",
+        AsyncMock(side_effect=close_all),
+        raising=False,
+    )
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        await server._close_all_sessions()
+    assert server.browser_session is browser
+    fail = False
+    await server._close_all_sessions()
+    assert server.browser_session is None
+    assert not server.active_sessions
+
+
+async def test_control_waits_for_execution_and_revokes_old_lease(observed_server):
+    """Stop waits for child cleanup; close does not admit an old queued request."""
+    server, observer, upstream = observed_server
+    entered = asyncio.Event()
+    cleaning = asyncio.Event()
+    release = asyncio.Event()
+
+    async def execute(*args):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaning.set()
+            await release.wait()
+
+    upstream.side_effect = execute
+    running = asyncio.create_task(
+        server._execute_tool(
+            "browser_type", {"_astrbot_action": {"action_id": "inflight", "lease": 1}}
+        )
+    )
+    await entered.wait()
+    await observer.start()
+    bridge = json.loads(observer.discovery.read_text())
+    payload = {
+        "generation": observer.generation,
+        "browser_session_id": "browser",
+        "operation": "stop",
+        "lease": 1,
+    }
+    try:
+        async with aiohttp.ClientSession(
+            headers={"Authorization": "Bearer secret"}
+        ) as http:
+            url = f"http://127.0.0.1:{bridge['port']}/control"
+            async with http.post(
+                url, json={**payload, "generation": "old"}
+            ) as response:
+                assert response.status == 409
+            stopping = asyncio.create_task(http.post(url, json=payload))
+            await asyncio.wait_for(cleaning.wait(), 2)
+            assert not stopping.done()
+            release.set()
+            with pytest.raises(RuntimeError, match="cancelled"):
+                await running
+            response = await stopping
+            state = await response.json()
+            response.release()
+            assert state["execution_state"] == "stopped"
+            assert state["current_action"] is None
+            assert state["recent_actions"][-1]["status"] == "cancelled"
+            assert observer.action_task is None
+            with pytest.raises(RuntimeError, match="stopped"):
+                await server._execute_tool(
+                    "browser_type", {"_astrbot_action": {"lease": 2}}
+                )
+            server._close_all_sessions = AsyncMock()
+            server._close_all_sessions.side_effect = RuntimeError("cleanup failed")
+            async with http.post(
+                url, json={**payload, "operation": "close"}
+            ) as response:
+                assert response.status == 500
+            assert observer.execution_state == "stopped"
+            server._close_all_sessions.side_effect = None
+            async with http.post(
+                url, json={**payload, "operation": "close"}
+            ) as response:
+                assert response.status == 200
+                assert (await response.json())["execution_state"] == "closed"
+            with pytest.raises(RuntimeError, match="stopped"):
+                await server._execute_tool(
+                    "browser_type", {"_astrbot_action": {"lease": 1}}
+                )
+            upstream.side_effect = None
+            await server._execute_tool(
+                "browser_type", {"_astrbot_action": {"lease": 3}}
+            )
+    finally:
+        release.set()
+        await observer.close()
+
+
 @pytest.fixture
 def observed_server(monkeypatch, tmp_path):
     """Load the real execution wrapper with a controllable upstream operation.

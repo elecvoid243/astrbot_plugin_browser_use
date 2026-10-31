@@ -39,6 +39,14 @@ class LocalBrowserServer(BrowserUseServer):
         observer = getattr(self, "observer", None)
         if observer is None:
             return await super()._execute_tool(tool_name, arguments)
+        if (
+            observer.execution_state in {"stopped", "disabled"}
+            or metadata.get("lease") in observer.revoked_leases
+        ):
+            raise RuntimeError(
+                "Browser execution stopped; close the session before restarting."
+            )
+        observer.execution_state = "active"
         action_id = metadata.get("action_id") or uuid4().hex
         if action_id in observer.cancelled_actions:
             raise RuntimeError("Browser action was cancelled before execution.")
@@ -68,12 +76,14 @@ class LocalBrowserServer(BrowserUseServer):
             "browser_session_id": browser.id if browser else None,
         }
         observer.current_action = action
+        observer.action_done.clear()
         execution = None
         observer.highlight = None
         status = "failed"
         try:
             await observer.action_changed()
             if action_id in observer.cancelled_actions:
+                status = "cancelled"
                 raise RuntimeError("Browser action cancelled before execution.")
             execution = asyncio.create_task(
                 self._execute_browser_action(tool_name, arguments)
@@ -105,19 +115,26 @@ class LocalBrowserServer(BrowserUseServer):
                 raise RuntimeError("Browser action cancelled.") from None
             raise
         finally:
-            # A host reconciliation can have finalized this action already.
-            if observer.current_action is action:
-                observer.current_action = None
-                if action["browser_session_id"] is None and self.browser_session:
-                    action["browser_session_id"] = self.browser_session.id
-                if status != "succeeded":
-                    observer.highlight = None
-                observer.recent_actions.append(
-                    {**action, "status": status, "finished_at": time.time()}
-                )
-                await observer.action_changed()
-            if observer.action_task is execution:
-                observer.action_task = None
+            try:
+                # A host reconciliation can have finalized this action already.
+                if observer.current_action is action:
+                    observer.current_action = None
+                    if action["browser_session_id"] is None and self.browser_session:
+                        action["browser_session_id"] = self.browser_session.id
+                    if status != "succeeded":
+                        observer.highlight = None
+                    observer.recent_actions.append(
+                        {**action, "status": status, "finished_at": time.time()}
+                    )
+                    await observer.action_changed(
+                        closed_session_id=action["browser_session_id"]
+                        if self.browser_session is None
+                        else None
+                    )
+            finally:
+                if observer.action_task is execution:
+                    observer.action_task = None
+                observer.action_done.set()
 
     async def _execute_browser_action(self, tool_name, arguments):
         """Require event handler success for navigation, scrolling and tab actions.
@@ -341,8 +358,15 @@ class LocalBrowserServer(BrowserUseServer):
         Raises:
             RuntimeError: A failed close left a previous owner's session behind.
         """
+        browser = self.browser_session
+        tools = self.tools
         result = await super()._close_all_sessions()
         if self.active_sessions:
+            # Upstream clears the current pointer even when a close failed.
+            # Retain the failed owned lifetime so authenticated cleanup can retry.
+            if browser is not None and browser.id in self.active_sessions:
+                self.browser_session = browser
+                self.tools = tools
             raise RuntimeError("Browser cleanup failed; ownership remains reserved.")
         return result
 

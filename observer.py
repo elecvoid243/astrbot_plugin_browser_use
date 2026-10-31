@@ -53,6 +53,11 @@ class BrowserObserver:
         self.action_task = None
         self.cancelled_actions = deque(maxlen=ACTION_LIMIT)
         self.highlight = None
+        self.execution_state = "active"
+        self.revoked_leases = deque(maxlen=ACTION_LIMIT)
+        self.action_done = asyncio.Event()
+        self.action_done.set()
+        self._control_lock = asyncio.Lock()
 
     async def start(self) -> None:
         """Bind an ephemeral loopback port and publish its discovery record.
@@ -62,9 +67,11 @@ class BrowserObserver:
         """
         app = web.Application()
         app.router.add_get("/status", self.observe)
+        app.router.add_get("/identity", self.observe)
         app.router.add_get("/snapshot", self.observe)
         app.router.add_get("/stream", self.stream)
         app.router.add_post("/action/cancel", self.cancel_action)
+        app.router.add_post("/control", self.control)
         self.runner = web.AppRunner(app, access_log=None)
         await self.runner.setup()
         site = web.TCPSite(self.runner, "127.0.0.1", 0)
@@ -93,6 +100,7 @@ class BrowserObserver:
             "sequence": self.sequence,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "available": browser is not None,
+            "execution_state": self.execution_state,
             "url": "",
             "title": "",
             "width": 0,
@@ -167,8 +175,12 @@ class BrowserObserver:
             else None,
         }
 
-    async def action_changed(self):
-        """Publish an authoritative action snapshot even during CDP failure."""
+    async def action_changed(self, closed_session_id=None):
+        """Publish an authoritative action snapshot even during CDP failure.
+
+        Args:
+            closed_session_id: Previous lifetime for a confirmed browser close.
+        """
         try:
             _, _, state = await asyncio.wait_for(self.read_state(), 2)
         except Exception:
@@ -184,6 +196,10 @@ class BrowserObserver:
                 "height": 0,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
+        if closed_session_id and not state.get("available"):
+            self.execution_state = "closed"
+            state.update(browser_session_id=closed_session_id, execution_state="closed")
+        state["execution_state"] = self.execution_state
         self.action_cursor = self.sequence + 1
         state.update(self.action_state(state["browser_session_id"]))
         event = self.publish("action", state)
@@ -206,6 +222,9 @@ class BrowserObserver:
         if body.get("generation") != self.generation:
             raise web.HTTPConflict()
         action_id = body.get("action_id")
+        if body.get("stop_execution"):
+            self.execution_state = "stopped"
+            self.revoked_leases.append(body.get("lease"))
         self.cancelled_actions.append(action_id)
         if self.current_action and self.current_action["action_id"] == action_id:
             action = self.current_action
@@ -222,8 +241,76 @@ class BrowserObserver:
             )
             if self.action_task:
                 self.action_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.action_task
+            await asyncio.wait_for(self.action_done.wait(), 10)
             await self.action_changed()
         return web.json_response({"ok": True})
+
+    async def control(self, request):
+        """Stop only the execution child, then optionally close owned browsers.
+
+        Args:
+            request: Authenticated internal request bound to this runtime/session.
+
+        Returns:
+            Confirmed terminal state after execution and cleanup have completed.
+
+        Raises:
+            HTTPUnauthorized: The private credential is missing or invalid.
+            HTTPConflict: The runtime or browser lifetime has expired.
+            HTTPBadRequest: The requested operation is unsupported.
+            Exception: Execution or browser cleanup cannot finish.
+        """
+        if not hmac.compare_digest(
+            request.headers.get("Authorization", ""), f"Bearer {self.token}"
+        ):
+            raise web.HTTPUnauthorized()
+        body = await request.json()
+        if body.get("generation") != self.generation or self._closed:
+            raise web.HTTPConflict(text="Browser generation expired.")
+        operation = body.get("operation")
+        if operation not in {"stop", "close", "disable"}:
+            raise web.HTTPBadRequest()
+        async with self._control_lock:
+            browser = self.server.browser_session
+            if operation != "disable" and (
+                browser is None or body.get("browser_session_id") != browser.id
+            ):
+                raise web.HTTPConflict(text="Browser session expired.")
+            self.execution_state = "stopped"
+            self.revoked_leases.append(body.get("lease"))
+            self.highlight = None
+            if self.current_action:
+                self.cancelled_actions.append(self.current_action["action_id"])
+                if self.action_task:
+                    self.action_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await self.action_task
+                await asyncio.wait_for(self.action_done.wait(), 10)
+            try:
+                _, _, state = await asyncio.wait_for(self.read_state(), 2)
+            except Exception:
+                state = {
+                    "generation": self.generation,
+                    "browser_session_id": browser.id if browser else None,
+                    "available": browser is not None,
+                    "url": "",
+                    "title": "",
+                    "width": 0,
+                    "height": 0,
+                }
+            if operation in {"close", "disable"}:
+                await self.server._close_all_sessions()
+                self.execution_state = (
+                    "disabled" if operation == "disable" else "closed"
+                )
+                state.update(available=False, url="", title="", width=0, height=0)
+            state.update(self.action_state(browser.id if browser else None))
+            state["execution_state"] = self.execution_state
+            self._refresh_stream = True
+            event = self.publish("state", state)
+            return web.json_response(event, headers={"Cache-Control": "no-store"})
 
     def publish(self, kind: str, state: dict) -> dict:
         """Order observations and replace each subscriber's pending event.
@@ -238,6 +325,7 @@ class BrowserObserver:
         self.sequence += 1
         event = {
             **state,
+            "execution_state": self.execution_state,
             **self.action_state(state.get("browser_session_id")),
             "type": kind,
             "sequence": self.sequence,
@@ -261,6 +349,15 @@ class BrowserObserver:
             raise web.HTTPUnauthorized()
         if request.query.get("generation") != self.generation:
             raise web.HTTPConflict(text="Browser generation expired.")
+        if request.path == "/identity":
+            browser = self.server.browser_session
+            return web.json_response(
+                {
+                    "generation": self.generation,
+                    "browser_session_id": browser.id if browser else None,
+                },
+                headers={"Cache-Control": "no-store"},
+            )
         browser, cdp, state = await self.read_state()
         if cdp is None:
             return web.json_response(state, headers={"Cache-Control": "no-store"})
@@ -367,20 +464,24 @@ class BrowserObserver:
         )
         try:
             await response.prepare(request)
-            while not self._closed and self.server.browser_session is browser:
+            while not self._closed:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=1)
-                    if (
-                        self.server.browser_session is not browser
-                        or event.get("browser_session_id") != browser.id
-                    ):
+                    if event is None:
                         break
+                    if event.get("browser_session_id") != browser.id:
+                        continue
                     data = f"id: {event['sequence']}\ndata: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
                     if len(data) > MAX_EVENT_BYTES:
                         break
                 except asyncio.TimeoutError:
                     data = b": hb\n\n"
                 await asyncio.wait_for(response.write(data), timeout=2)
+                if data != b": hb\n\n" and event.get("execution_state") in {
+                    "closed",
+                    "disabled",
+                }:
+                    break
         except (ConnectionError, asyncio.TimeoutError):
             pass
         finally:
@@ -606,6 +707,8 @@ class BrowserObserver:
     async def close(self) -> None:
         """Release the bridge and remove only this process's discovery record."""
         self._closed = True
+        for queue in self.subscribers:
+            queue.put_nowait(None)
         if self._producer is not None:
             self._producer.cancel()
             with contextlib.suppress(asyncio.CancelledError):

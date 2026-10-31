@@ -23,6 +23,235 @@ from starlette.responses import StreamingResponse
 from runtime import build_mcp_config
 
 
+async def test_real_disable_and_reenable(plugin_class, tmp_path, monkeypatch):
+    """Exercise plugin lifecycle against private Chromium using a stdio host adapter.
+
+    Args:
+        plugin_class: Plugin with isolated host API, DB and lifecycle adapters.
+        tmp_path: Disposable runtime data, never a user's installed profile.
+        monkeypatch: Cleanup for authenticated request binding.
+    """
+    root = Path(__file__).resolve().parents[1]
+    if not (root / "runtime/python/python.exe").exists():
+        pytest.skip("The optional bundled Windows runtime is not installed.")
+    from browser_use_plugin_under_test.owned_tool import OwnedBrowserTool
+
+    class ProcessManager:
+        """Use real stdio tools while retaining AstrBot's lifecycle API boundary."""
+
+        def __init__(self):
+            self.mcp_server_runtime_view = {}
+            self.func_list = []
+            self.process = None
+            self.request_id = 0
+            self.rpc_lock = asyncio.Lock()
+
+        async def rpc(self, method, params):
+            """Send one serialized JSON-RPC request and read its matching result.
+
+            Args:
+                method: MCP operation name.
+                params: Operation arguments.
+
+            Returns:
+                The private MCP result.
+            """
+            async with self.rpc_lock:
+                self.request_id += 1
+                self.process.stdin.write(
+                    (
+                        json.dumps(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": self.request_id,
+                                "method": method,
+                                "params": params,
+                            }
+                        )
+                        + "\n"
+                    ).encode()
+                )
+                await self.process.stdin.drain()
+                while True:
+                    line = await asyncio.wait_for(self.process.stdout.readline(), 60)
+                    assert line
+                    response = json.loads(line)
+                    if response.get("id") == self.request_id:
+                        assert "error" not in response, response
+                        return response["result"]
+
+        async def enable_mcp_server(self, name, config, shutdown_event, timeout):
+            """Start real MCP with a host lifecycle adapter.
+
+            Args:
+                name: Owned MCP registration name.
+                config: Plugin-generated private launch configuration.
+                shutdown_event: Host ownership marker.
+                timeout: Host startup limit, unused by this bounded probe.
+            """
+            self.process = await asyncio.create_subprocess_exec(
+                config["command"],
+                *config["args"],
+                cwd=config["cwd"],
+                env={**os.environ, **config["env"]},
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await self.rpc(
+                "initialize",
+                {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "b05-lifecycle", "version": "1"},
+                },
+            )
+            self.process.stdin.write(
+                b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n'
+            )
+            await self.process.stdin.drain()
+
+            async def call_tool(name=None, arguments=None, **kwargs):
+                result = await self.rpc(
+                    "tools/call",
+                    {"name": name or kwargs["tool_name"], "arguments": arguments or {}},
+                )
+                return SimpleNamespace(
+                    isError=result.get("isError", False), content=result["content"]
+                )
+
+            client = SimpleNamespace(
+                session=SimpleNamespace(call_tool=call_tool),
+                call_tool_with_reconnect=call_tool,
+                _reconnect_lock=asyncio.Lock(),
+                _mcp_server_config=config,
+            )
+            self.mcp_server_runtime_view[name] = SimpleNamespace(
+                client=client, shutdown_event=shutdown_event
+            )
+            self.func_list = [
+                SimpleNamespace(
+                    mcp_tool=SimpleNamespace(name=tool),
+                    mcp_client=client,
+                    mcp_server_name=name,
+                    active=True,
+                )
+                for tool in ("browser_navigate", "browser_get_html")
+            ]
+
+        async def disable_mcp_server(self, name, timeout):
+            """End the owned stdio transport and verify clean subprocess exit.
+
+            Args:
+                name: Registration to remove after process exit.
+                timeout: Maximum shutdown wait.
+            """
+            self.process.stdin.close()
+            await asyncio.wait_for(self.process.wait(), timeout)
+            assert self.process.returncode == 0
+            self.mcp_server_runtime_view.pop(name)
+            self.func_list = []
+
+    app = web.Application()
+    entered = asyncio.Event()
+
+    async def page(request):
+        if request.path == "/slow":
+            entered.set()
+            await asyncio.sleep(3)
+        return web.Response(
+            text="<title>B05 lifecycle</title><p>Actual private Chromium</p>",
+            content_type="text/html",
+        )
+
+    app.router.add_get("/{path:.*}", page)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    url = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
+    manager = ProcessManager()
+    db = SimpleNamespace(
+        get_platform_session_by_id=AsyncMock(
+            return_value=SimpleNamespace(creator="alice", platform_id="webchat")
+        )
+    )
+    plugin = plugin_class(
+        SimpleNamespace(
+            get_llm_tool_manager=lambda: manager,
+            get_db=lambda: db,
+            register_web_api=lambda *args: None,
+        ),
+        {},
+    )
+    event = SimpleNamespace(
+        unified_msg_origin="webchat:FriendMessage:webchat!alice!chat-1",
+        get_platform_name=lambda: "webchat",
+        get_session_id=lambda: "webchat!alice!chat-1",
+    )
+    context = SimpleNamespace(
+        context=SimpleNamespace(event=event), tool_call_timeout=60
+    )
+    entry = sys.modules[plugin_class.__module__]
+    try:
+        await plugin.initialize()
+        old = manager.func_list[0]
+        assert isinstance(old, OwnedBrowserTool)
+        assert not (await old.call(context, url=url)).isError
+        old_bridge = json.loads(plugin._bridge_file.read_text())
+        monkeypatch.setattr(
+            entry,
+            "request",
+            SimpleNamespace(
+                username="alice",
+                query={"chat_id": "chat-1"},
+                path="/browser-use/status",
+            ),
+        )
+        state = json.loads((await plugin.browser_observation()).body)["data"]
+        running = asyncio.create_task(old.call(context, url=url + "/slow"))
+        await asyncio.wait_for(entered.wait(), 5)
+        await plugin.terminate()
+        assert (await running).isError
+        assert not manager.mcp_server_runtime_view
+        assert (await plugin.browser_observation()).status_code == 503
+        async with aiohttp.ClientSession() as http:
+            with pytest.raises(aiohttp.ClientConnectionError):
+                await http.get(f"http://127.0.0.1:{old_bridge['port']}/status")
+        await plugin.initialize()
+        new_bridge = json.loads(plugin._bridge_file.read_text())
+        assert new_bridge["generation"] != old_bridge["generation"]
+        with pytest.raises(RuntimeError, match="disabled"):
+            await old.call(context, url=url)
+        assert not (await manager.func_list[0].call(context, url=url)).isError
+        assert "Actual private Chromium" in str(
+            (await manager.func_list[1].call(context)).content
+        )
+        monkeypatch.setattr(
+            entry,
+            "request",
+            SimpleNamespace(
+                username="alice",
+                query={
+                    "chat_id": "chat-1",
+                    "generation": state["generation"],
+                    "browser_session_id": state["browser_session_id"],
+                },
+                path="/browser-use/close",
+            ),
+        )
+        assert (await plugin.browser_observation()).status_code == 409
+        print(
+            "B05_REAL_LIFECYCLE in-flight disable, socket release, new generation, stale tool/control refusal and re-enabled Chromium passed"
+        )
+    finally:
+        await plugin.terminate()
+        if manager.process is not None and manager.process.returncode is None:
+            manager.process.kill()
+            await manager.process.wait()
+        await runner.cleanup()
+
+
 async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
     """Verify real form state, bridge credentials, ownership and stale identities.
 
@@ -46,7 +275,7 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
 
     async def slow_page(request):
         slow_started.set()
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(float(request.query.get("delay", "0.5")))
         return web.Response(
             text="<title>Slow local page</title>", content_type="text/html"
         )
@@ -218,6 +447,23 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
         assert state["title"] == "Same browser 登录态"
         assert state["url"] == f"http://127.0.0.1:{port}/"
         identity = {key: state[key] for key in ("generation", "browser_session_id")}
+        before_control = plugin._lease
+        assert (await observe("stop", username=None, **identity)).status_code == 401
+        assert (
+            await observe("close", username="mallory", **identity)
+        ).status_code == 403
+        assert (await observe("stop", chat_id="chat-2", **identity)).status_code == 409
+        assert (
+            await observe(
+                "stop", generation="old", browser_session_id=state["browser_session_id"]
+            )
+        ).status_code == 409
+        assert (
+            await observe(
+                "close", generation=state["generation"], browser_session_id="old"
+            )
+        ).status_code == 409
+        assert plugin._lease == before_control
         frame_response = await observe("snapshot", **identity)
         assert frame_response.status_code == 200
         frame = json.loads(frame_response.body)["data"]
@@ -360,7 +606,7 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                 )
                 scope = {
                     "type": "http",
-                    "method": "GET",
+                    "method": request.method,
                     "scheme": "http",
                     "path": request.path,
                     "query_string": request.query_string.encode(),
@@ -404,8 +650,8 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                 )
 
             host = web.Application()
-            host.router.add_get(
-                "/api/v1/plugins/extensions/browser-use/{kind}", plugin_http
+            host.router.add_route(
+                "*", "/api/v1/plugins/extensions/browser-use/{kind}", plugin_http
             )
 
             async def spcode_fixture(request):
@@ -672,6 +918,59 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                                 path=str(destination / "agent-browser-autoscroll.png"),
                                 animations="disabled",
                             )
+                        # Stop a real in-flight navigation through the production UI.
+                        slow_started.clear()
+                        running = asyncio.create_task(
+                            tool(
+                                "browser_navigate",
+                                url=f"http://127.0.0.1:{port}/slow?delay=5",
+                                _allow_error=True,
+                            )
+                        )
+                        await asyncio.wait_for(slow_started.wait(), 5)
+                        async with ui.expect_response(
+                            lambda response: "/browser-use/stop?" in response.url
+                        ) as reply:
+                            await ui.locator(".agent-browser-stop").click()
+                        reply = await reply.value
+                        assert reply.status == 200, await reply.text()
+                        assert (await reply.json())["data"][
+                            "execution_state"
+                        ] == "stopped"
+                        await ui.wait_for_function(
+                            "document.querySelector('.agent-browser-view')?.dataset.connection === 'stopped'",
+                            timeout=15000,
+                        )
+                        stopped_result = await running
+                        assert stopped_result.isError
+                        stopped_state = json.loads((await observe()).body)["data"]
+                        assert stopped_state["current_action"] is None
+                        assert stopped_state["recent_actions"][-1]["status"] in {
+                            "cancelled",
+                            "succeeded",
+                        }
+                        with pytest.raises(RuntimeError, match="stopped"):
+                            await tool("browser_get_html")
+                        if evidence:
+                            await ui.screenshot(
+                                path=str(destination / "agent-browser-stopped.png"),
+                                animations="disabled",
+                            )
+                        await ui.locator(".agent-browser-close").click()
+                        await ui.wait_for_function(
+                            "document.querySelector('.agent-browser-view')?.dataset.connection === 'closed'",
+                            timeout=15000,
+                        )
+                        assert await ui.locator(".agent-browser-image img").count() == 0
+                        assert plugin._owner is None
+                        await tool("browser_navigate", url=f"http://127.0.0.1:{port}/")
+                        await ui.wait_for_function(
+                            "document.querySelector('.agent-browser-view')?.dataset.connection === 'live'",
+                            timeout=15000,
+                        )
+                        print(
+                            "B05_UI_CONTROL real stop, terminal action, closed stream and same-chat fresh session passed"
+                        )
                     finally:
                         await viewer.close()
             finally:
@@ -726,6 +1025,13 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                 params={"generation": state["generation"]},
             ) as response:
                 assert response.status == 401
+        closed = await observe(
+            "close",
+            generation=cancelled_state["generation"],
+            browser_session_id=cancelled_state["browser_session_id"],
+        )
+        assert closed.status_code == 200
+        await tool("browser_navigate", url=f"http://127.0.0.1:{port}/")
         await tool("browser_navigate", url=f"http://127.0.0.1:{port}/check")
         await tool("browser_close_all")
         assert plugin._owner is None

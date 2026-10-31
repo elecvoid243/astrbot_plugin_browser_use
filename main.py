@@ -13,6 +13,7 @@ from uuid import uuid4
 import aiohttp
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.web import error_response, json_response, request
+from astrbot.core.utils.active_event_registry import active_event_registry
 from starlette.responses import StreamingResponse
 
 from .observation_queue import ObservationQueue
@@ -41,6 +42,11 @@ class BrowserUsePlugin(Star):
         self._enabled = False
         self._bridge_file: Path | None = None
         self._bridge_token = ""
+        self._lease = 0
+        self._stopped = False
+        self._disable_revision = 0
+        self._control_lock = asyncio.Lock()
+        self._closed_state = None
 
     async def initialize(self) -> None:
         """Connect the private MCP runtime and expose its browser tools.
@@ -50,7 +56,10 @@ class BrowserUsePlugin(Star):
             RuntimeError: Another instance already owns the server name.
             Exception: Runtime configuration or MCP initialization fails.
         """
+        revision = self._disable_revision
         async with self._lock:
+            if revision != self._disable_revision:
+                return
             manager = self.context.get_llm_tool_manager()
             runtime = manager.mcp_server_runtime_view.get(SERVER_NAME)
             if runtime is not None:
@@ -66,6 +75,9 @@ class BrowserUsePlugin(Star):
             self._bridge_token = secrets.token_urlsafe(32)
             self._owner = None
             self._webchat_owner = None
+            self._stopped = False
+            self._closed_state = None
+            self._lease += 1
             mcp_config["env"].update(
                 ASTRBOT_BROWSER_BRIDGE_TOKEN=self._bridge_token,
                 ASTRBOT_BROWSER_BRIDGE_FILE=str(self._bridge_file),
@@ -90,7 +102,17 @@ class BrowserUsePlugin(Star):
                         in {"retry_with_browser_use_agent", "browser_extract_content"}
                     )
                 ]
+                if revision != self._disable_revision:
+                    # Retained tools are guarded even when disable overtakes startup.
+                    return
                 self._enabled = True
+                for control in ("stop", "close"):
+                    self.context.register_web_api(
+                        f"/browser-use/{control}",
+                        self.browser_observation,
+                        ["POST"],
+                        "Stop execution or close the current chat's Agent browser.",
+                    )
                 self.context.register_web_api(
                     "/browser-use/status",
                     self.browser_observation,
@@ -116,8 +138,8 @@ class BrowserUsePlugin(Star):
                     and runtime.shutdown_event is self._shutdown_event
                 ):
                     await manager.disable_mcp_server(SERVER_NAME, timeout=15)
-                self._shutdown_event = None
                 self._enabled = False
+                self._shutdown_event = None
                 raise
             self.logger.info("Browser Use MCP connected using its private runtime.")
 
@@ -127,8 +149,11 @@ class BrowserUsePlugin(Star):
         Raises:
             Exception: AstrBot cannot finish shutting down the owned MCP runtime.
         """
+        self._disable_revision += 1
+        self._enabled = False
+        self._stopped = True
+        self._lease += 1
         async with self._lock:
-            self._enabled = False
             if self._shutdown_event is None:
                 return
             manager = self.context.get_llm_tool_manager()
@@ -144,6 +169,37 @@ class BrowserUsePlugin(Star):
                 session = runtime.client.session
                 runtime.client.session = None
                 runtime.client._mcp_server_config = None
+
+                # Stop the execution child before closing the browser or MCP transport.
+                if self._bridge_file is not None and self._bridge_file.exists():
+                    try:
+                        bridge = json.loads(
+                            self._bridge_file.read_text(encoding="utf-8")
+                        )
+                        async with aiohttp.ClientSession(
+                            timeout=aiohttp.ClientTimeout(total=15)
+                        ) as client:
+                            async with client.post(
+                                f"http://127.0.0.1:{int(bridge['port'])}/control",
+                                headers={
+                                    "Authorization": f"Bearer {self._bridge_token}"
+                                },
+                                json={
+                                    "generation": bridge["generation"],
+                                    "operation": "disable",
+                                },
+                            ) as response:
+                                response.raise_for_status()
+                    except (
+                        OSError,
+                        ValueError,
+                        aiohttp.ClientError,
+                        asyncio.TimeoutError,
+                    ):
+                        self.logger.warning(
+                            "Browser bridge cleanup unavailable; stopping owned MCP."
+                        )
+
                 if session is not None:
                     try:
                         await asyncio.wait_for(
@@ -191,13 +247,28 @@ class BrowserUsePlugin(Star):
                 data={"reason": "busy"},
             )
         if self._owner is None:
+            if request.path.rsplit("/", 1)[-1] in {
+                "stop",
+                "close",
+                "snapshot",
+                "stream",
+            }:
+                return error_response("Browser session expired.", status_code=409)
             return json_response(
-                {"status": "ok", "data": {"available": False}},
+                {
+                    "status": "ok",
+                    "data": self._closed_state[1]
+                    if self._closed_state
+                    and self._closed_state[0] == (request.username, cid)
+                    else {"available": False},
+                },
                 headers={"Cache-Control": "no-store"},
             )
         owner = self._owner
+        lease = self._lease
+        token = self._bridge_token
         path = request.path.rsplit("/", 1)[-1]
-        if path not in {"snapshot", "stream"}:
+        if path not in {"snapshot", "stream", "stop", "close"}:
             path = "status"
         try:
             if self._bridge_file is None:
@@ -205,19 +276,26 @@ class BrowserUsePlugin(Star):
             bridge = json.loads(self._bridge_file.read_text(encoding="utf-8"))
             generation = request.query.get("generation")
             browser_session_id = request.query.get("browser_session_id")
-            if path in {"snapshot", "stream"} and (
+            if path in {"snapshot", "stream", "stop", "close"} and (
                 not generation or not browser_session_id
             ):
                 return error_response("Browser identity is required.", status_code=400)
             if generation is not None and generation != bridge["generation"]:
                 return error_response("Browser generation expired.", status_code=409)
+            private_path = (
+                "identity"
+                if path in {"stop", "close"}
+                else "snapshot"
+                if path == "snapshot"
+                else "status"
+            )
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as client:
                 async with client.get(
-                    f"http://127.0.0.1:{int(bridge['port'])}/{'status' if path == 'stream' else path}",
+                    f"http://127.0.0.1:{int(bridge['port'])}/{private_path}",
                     params={"generation": bridge["generation"]},
-                    headers={"Authorization": f"Bearer {self._bridge_token}"},
+                    headers={"Authorization": f"Bearer {token}"},
                 ) as response:
                     if response.status != 200:
                         return error_response(
@@ -225,13 +303,22 @@ class BrowserUsePlugin(Star):
                             status_code=409,
                         )
                     state = await response.json()
-            if not self._enabled or self._owner != owner:
+            if (
+                not self._enabled
+                or self._owner != owner
+                or self._lease != lease
+                or self._bridge_token != token
+            ):
                 return error_response("Browser ownership expired.", status_code=409)
             if (
                 browser_session_id is not None
                 and browser_session_id != state["browser_session_id"]
             ):
                 return error_response("Browser session expired.", status_code=409)
+            if path in {"stop", "close"}:
+                return await self.browser_control(
+                    path, bridge, state, owner, lease, token
+                )
             if path == "stream":
                 try:
                     action_cursor = int(request.query.get("action_cursor", "0"))
@@ -255,6 +342,68 @@ class BrowserUsePlugin(Star):
                 "Browser runtime unavailable.",
                 status_code=503,
                 data={"reason": "runtime_unavailable"},
+            )
+
+    async def browser_control(self, operation, bridge, state, owner, lease, token):
+        """Revoke queued calls and wait for real execution/browser cleanup.
+
+        Args:
+            operation: Authorized stop or close operation.
+            bridge: Captured private bridge discovery.
+            state: Validated browser lifetime snapshot.
+            owner: Trusted chat owner.
+            lease: Admission epoch before this control request.
+            token: Captured activation credential.
+
+        Returns:
+            Confirmed runtime state, or an explicit stale request error.
+
+        Raises:
+            ClientError: The private runtime cannot confirm cleanup.
+            TimeoutError: The private operation exceeds the control deadline.
+        """
+        async with self._control_lock:
+            if (
+                not self._enabled
+                or self._lease != lease
+                or self._bridge_token != token
+                or self._owner != owner
+            ):
+                return error_response("Browser ownership expired.", status_code=409)
+            self._stopped = True
+            self._lease += 1
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=20)
+            ) as client:
+                async with client.post(
+                    f"http://127.0.0.1:{int(bridge['port'])}/control",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={
+                        "generation": bridge["generation"],
+                        "browser_session_id": state["browser_session_id"],
+                        "operation": operation,
+                        "lease": lease,
+                    },
+                ) as response:
+                    response.raise_for_status()
+                    result = await response.json()
+            async with self._operation_lock:
+                if not self._enabled or self._bridge_token != token:
+                    return error_response(
+                        "Browser Use is disabled.",
+                        status_code=503,
+                        data={"reason": "disabled"},
+                    )
+                if operation == "close":
+                    self._closed_state = (self._webchat_owner, result)
+                    self._owner = None
+                    self._webchat_owner = None
+                    self._stopped = False
+                # The browser request has drained. Cancelling a runner before this
+                # point could cancel the MCP SDK handler instead of its child.
+                active_event_registry.request_agent_stop_all(owner)
+            return json_response(
+                {"status": "ok", "data": result}, headers={"Cache-Control": "no-store"}
             )
 
     def browser_stream(

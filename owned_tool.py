@@ -24,6 +24,7 @@ class OwnedBrowserTool(MCPTool):
         super().__init__(tool.mcp_tool, tool.mcp_client, tool.mcp_server_name)
         self.active = tool.active
         self.plugin = plugin
+        self.activation_token = plugin._bridge_token
 
     async def call(self, context, **kwargs):
         """Admit only a trusted event owner before invoking the private MCP.
@@ -50,37 +51,55 @@ class OwnedBrowserTool(MCPTool):
                 raise ValueError("Browser tools require a valid WebChat identity.")
             webchat = (parts[1], parts[2])
         plugin = self.plugin
-        if not plugin._enabled:
+        if not plugin._enabled or self.activation_token != plugin._bridge_token:
             raise RuntimeError("Browser Use is disabled.")
+        if plugin._stopped or getattr(event, "get_extra", lambda *args: False)(
+            "agent_stop_requested", False
+        ):
+            raise RuntimeError(
+                "Browser execution stopped. Close the browser before restarting."
+            )
         if plugin._owner is None:
             plugin._owner = owner
             plugin._webchat_owner = webchat
+            plugin._closed_state = None
         elif plugin._owner != owner:
             raise RuntimeError("Browser is busy in another chat. Close it there first.")
+        lease = plugin._lease
         async with plugin._operation_lock:
-            if not plugin._enabled:
+            if not plugin._enabled or self.activation_token != plugin._bridge_token:
                 raise RuntimeError("Browser Use is disabled.")
-            if plugin._owner != owner:
+            if plugin._owner != owner or plugin._lease != lease or plugin._stopped:
                 raise RuntimeError("Browser ownership expired; retry from this chat.")
             action_id = uuid4().hex
             activation_token = plugin._bridge_token
             bridge = None
             if plugin._bridge_file is not None:
                 bridge = json.loads(plugin._bridge_file.read_text(encoding="utf-8"))
+            execution = None
             try:
                 # Reserved metadata is overwritten after model argument expansion.
-                result = await super().call(
-                    context,
-                    **{
-                        **kwargs,
-                        "_astrbot_action": {
-                            "action_id": action_id,
-                            "invocation_id": current_tool_invocation.get(),
-                            "timeout": max(0.01, context.tool_call_timeout * 0.95),
+                execution = asyncio.create_task(
+                    super().call(
+                        context,
+                        **{
+                            **kwargs,
+                            "_astrbot_action": {
+                                "action_id": action_id,
+                                "invocation_id": current_tool_invocation.get(),
+                                "timeout": max(0.01, context.tool_call_timeout * 0.95),
+                                "lease": lease,
+                            },
                         },
-                    },
+                    )
                 )
+                # Reconcile cancellation through the private child-task protocol;
+                # cancelling the MCP SDK request itself can end its whole service.
+                result = await asyncio.shield(execution)
             except BaseException as exc:
+                if isinstance(exc, asyncio.CancelledError) and plugin._lease == lease:
+                    plugin._stopped = True
+                    plugin._lease += 1
                 # MCP cancellation can arrive after its execution response is lost.
                 # Reconcile using the captured activation, never a restarted bridge.
                 if bridge is not None:
@@ -94,6 +113,10 @@ class OwnedBrowserTool(MCPTool):
                                 json={
                                     "generation": bridge["generation"],
                                     "action_id": action_id,
+                                    "lease": lease,
+                                    "stop_execution": isinstance(
+                                        exc, asyncio.CancelledError
+                                    ),
                                     "status": "cancelled"
                                     if isinstance(exc, asyncio.CancelledError)
                                     else "timed_out"
@@ -110,9 +133,23 @@ class OwnedBrowserTool(MCPTool):
                         plugin.logger.warning(
                             "Browser action reconciliation unavailable."
                         )
+                if execution is not None:
+                    try:
+                        await asyncio.wait_for(asyncio.shield(execution), 5)
+                    except (Exception, asyncio.CancelledError):
+                        execution.add_done_callback(
+                            lambda future: (
+                                None if future.cancelled() else future.exception()
+                            )
+                        )
                 raise
             # Closing the entire browser is the explicit ownership handoff.
-            if self.mcp_tool.name == "browser_close_all" and not result.isError:
+            if (
+                self.mcp_tool.name
+                in {"browser_close_all", "browser_close_session", "browser_close"}
+                and not result.isError
+            ):
                 plugin._owner = None
                 plugin._webchat_owner = None
+                plugin._lease += 1
             return result

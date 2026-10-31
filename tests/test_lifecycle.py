@@ -211,10 +211,27 @@ async def test_disable_waits_for_inflight_start(plugin):
     starting = asyncio.create_task(instance.initialize())
     await manager.started.wait()
     stopping = asyncio.create_task(instance.terminate())
+    await asyncio.sleep(0)
+    assert not instance._enabled
     manager.gate.set()
     await asyncio.gather(starting, stopping)
     assert manager.disable_calls == [SERVER_NAME]
     assert not manager.mcp_server_runtime_view
+
+
+async def test_retained_tools_rejected_after_reenable(plugin):
+    instance, manager = plugin
+    await instance.initialize()
+    retained = manager.func_list[-1]
+    await instance.terminate()
+    await instance.initialize()
+    event = SimpleNamespace(
+        unified_msg_origin="trusted", get_platform_name=lambda: "qq"
+    )
+    with pytest.raises(RuntimeError, match="disabled"):
+        await retained.call(SimpleNamespace(context=SimpleNamespace(event=event)))
+    assert instance._owner is None
+    await instance.terminate()
 
 
 async def test_cancelled_start_does_not_leak_mcp(plugin):

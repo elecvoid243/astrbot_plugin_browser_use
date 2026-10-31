@@ -39,6 +39,8 @@ def plugin_class(monkeypatch, tmp_path):
         "astrbot.core.agent",
         "astrbot.core.agent.mcp_client",
         "astrbot.core.agent.tool",
+        "astrbot.core.utils",
+        "astrbot.core.utils.active_event_registry",
     ):
         module = types.ModuleType(name)
         monkeypatch.setitem(sys.modules, name, module)
@@ -65,6 +67,11 @@ def plugin_class(monkeypatch, tmp_path):
     sys.modules["astrbot.core.agent.mcp_client"].MCPTool = MCPTool
     sys.modules["astrbot.core.agent.tool"].current_tool_invocation = ContextVar(
         "invocation", default=None
+    )
+    sys.modules[
+        "astrbot.core.utils.active_event_registry"
+    ].active_event_registry = types.SimpleNamespace(
+        request_agent_stop_all=lambda owner: 0
     )
     web = types.ModuleType("astrbot.api.web")
     web.request = types.SimpleNamespace()
