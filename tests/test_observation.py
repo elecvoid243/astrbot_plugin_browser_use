@@ -57,7 +57,7 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
 
     async def page(request):
         return web.Response(
-            text='<!doctype html><meta charset="utf-8"><title>Same browser 登录态</title><input placeholder="value"><p id="login"></p><p id="tick"></p><a target="_blank" href="/second">Second tab</a><div style="height:2500px;background:linear-gradient(white,blue)"></div><script>document.cookie="session=private";document.querySelector("#login").textContent="Logged in: " + document.cookie;let tick=0;setInterval(()=>document.querySelector("#tick").textContent="Live tick " + (++tick),100)</script>',
+            text='<!doctype html><meta charset="utf-8"><title>Same browser 登录态</title><input placeholder="value"><p id="login"></p><p id="tick"></p><a target="_blank" href="/second">Second tab</a><div style="height:2500px;background:linear-gradient(white,blue)"></div><label>Below-fold input <input placeholder="below-fold"></label><div style="height:600px"></div><script>document.cookie="session=private";document.querySelector("#login").textContent="Logged in: " + document.cookie;let tick=0;setInterval(()=>document.querySelector("#tick").textContent="Live tick " + (++tick),100)</script>',
             content_type="text/html",
         )
 
@@ -515,6 +515,52 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                             )
                             await ui.screenshot(
                                 path=str(destination / "agent-browser-en.png"),
+                                animations="disabled",
+                            )
+                        # Resolve a real off-screen target, return to the top,
+                        # then let the input action itself scroll the page.
+                        for _ in range(6):
+                            await tool("browser_scroll", direction="down")
+                        elements = json.loads(
+                            (await tool("browser_get_state")).content[0]["text"]
+                        )["interactive_elements"]
+                        below_index = next(
+                            item["index"]
+                            for item in elements
+                            if item.get("placeholder") == "below-fold"
+                        )
+                        for _ in range(6):
+                            await tool("browser_scroll", direction="up")
+                        top_state = json.loads((await observe()).body)["data"]
+                        assert top_state["scroll_y"] == 0
+                        await tool(
+                            "browser_type", index=below_index, text="自动滚动输入验证"
+                        )
+                        moved = json.loads((await observe()).body)["data"]
+                        assert moved["scroll_y"] > 500
+                        target = moved["highlight"]
+                        assert target and target["scroll_y"] == moved["scroll_y"]
+                        assert 0 <= target["y"] < moved["viewport_height"]
+                        await ui.wait_for_function(
+                            "(id) => document.querySelector('.agent-browser-target') && document.querySelector('.agent-browser-actions li')?.dataset.actionId === id && document.querySelector('.agent-browser-image img')?.naturalWidth === 1280",
+                            arg=target["action_id"],
+                            timeout=5000,
+                        )
+                        error = await ui.evaluate(
+                            """(point) => {
+                            const image = document.querySelector('.agent-browser-image img').getBoundingClientRect();
+                            const marker = document.querySelector('.agent-browser-target').getBoundingClientRect();
+                            return Math.max(Math.abs(marker.x + marker.width / 2 - image.x - point.x / point.viewport_width * image.width), Math.abs(marker.y + marker.height / 2 - image.y - point.y / point.viewport_height * image.height));
+                        }""",
+                            target,
+                        )
+                        assert error < 1
+                        print(
+                            f"AUTOSCROLL_TARGET scroll_y={moved['scroll_y']} x={target['x']} y={target['y']} render_error={error:.3f}px"
+                        )
+                        if evidence:
+                            await ui.screenshot(
+                                path=str(destination / "agent-browser-autoscroll.png"),
                                 animations="disabled",
                             )
                     finally:

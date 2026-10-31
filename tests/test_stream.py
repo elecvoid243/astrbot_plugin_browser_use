@@ -16,14 +16,24 @@ from observation_queue import ObservationQueue
 from observer import BrowserObserver
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"scroll_y": 500},
+        {"scroll_x": 100},
+        {"viewport_width": 1024},
+        {"viewport_height": 600},
+    ],
+)
 async def test_delayed_cdp_frame_is_acknowledged_but_not_published(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, change
 ):
     """Reject an old target's frame while keeping its CDP acknowledgement alive.
 
     Args:
         monkeypatch: Isolated bridge credentials.
         tmp_path: Disposable discovery directory.
+        change: Coordinate-space change after the first accepted frame.
     """
     monkeypatch.setenv("ASTRBOT_BROWSER_BRIDGE_TOKEN", "secret")
     monkeypatch.setenv("ASTRBOT_BROWSER_BRIDGE_FILE", str(tmp_path / "bridge.json"))
@@ -53,6 +63,10 @@ async def test_delayed_cdp_frame_is_acknowledged_but_not_published(
         "tab_id": "current",
         "url": "local",
         "title": "Current",
+        "viewport_width": 1280,
+        "viewport_height": 720,
+        "scroll_x": 0,
+        "scroll_y": 0,
     }
     observer.read_state = AsyncMock(return_value=(browser, cdp, state))
     queue = ObservationQueue()
@@ -64,7 +78,15 @@ async def test_delayed_cdp_frame_is_acknowledged_but_not_published(
         event = {
             "sessionId": 10,
             "data": "stale-image",
-            "metadata": {"timestamp": time.time()},
+            "metadata": {
+                "timestamp": time.time(),
+                "deviceWidth": 1280,
+                "deviceHeight": 720,
+                "scrollOffsetX": 0,
+                "scrollOffsetY": 0,
+                "pageScaleFactor": 1,
+                "offsetTop": 0,
+            },
         }
         callbacks[0](event, "old-session")
         await asyncio.wait_for(acked.wait(), 2)
@@ -78,6 +100,29 @@ async def test_delayed_cdp_frame_is_acknowledged_but_not_published(
         frame = await asyncio.wait_for(queue.get(), 2)
         assert frame["type"] == "frame" and frame["tab_id"] == "current"
         assert ack.await_count == 2
+        # Sampling new metadata cannot relabel a delayed old-space CDP image.
+        state.update(change)
+        event.update(sessionId=12)
+        callbacks[0](event, "current-session")
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(queue.get(), 0.3)
+        assert ack.await_count == 3
+        for frame_key, state_key in (
+            ("deviceWidth", "viewport_width"),
+            ("deviceHeight", "viewport_height"),
+            ("scrollOffsetX", "scroll_x"),
+            ("scrollOffsetY", "scroll_y"),
+        ):
+            event["metadata"][frame_key] = state[state_key]
+        image = io.BytesIO()
+        Image.new("RGB", (state["viewport_width"], state["viewport_height"])).save(
+            image, format="JPEG"
+        )
+        event.update(sessionId=13, data=base64.b64encode(image.getvalue()).decode())
+        callbacks[0](event, "current-session")
+        matched = await asyncio.wait_for(queue.get(), 2)
+        assert matched["type"] == "frame"
+        assert all(matched[key] == value for key, value in change.items())
     finally:
         capture.cancel()
         with contextlib.suppress(asyncio.CancelledError):

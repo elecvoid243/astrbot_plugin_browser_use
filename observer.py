@@ -8,6 +8,7 @@ import contextlib
 import hmac
 import io
 import json
+import math
 import os
 import time
 from collections import deque
@@ -505,7 +506,37 @@ class BrowserObserver:
                         self.publish("state", state)
                     metadata = state
                     event, pending = pending, None
-                    if event is not None and cdp is not None:
+                    frame_metadata = event.get("metadata", {}) if event else {}
+                    # Frame metadata belongs to these pixels; read_state() is a
+                    # later independent sample and must not relabel an old view.
+                    coordinates_match = all(
+                        isinstance(actual, (int, float))
+                        and isinstance(expected, (int, float))
+                        and math.isfinite(actual)
+                        and math.isfinite(expected)
+                        and math.isclose(actual, expected, rel_tol=0, abs_tol=0.001)
+                        for actual, expected in (
+                            (
+                                frame_metadata.get("scrollOffsetX"),
+                                state.get("scroll_x"),
+                            ),
+                            (
+                                frame_metadata.get("scrollOffsetY"),
+                                state.get("scroll_y"),
+                            ),
+                            (
+                                frame_metadata.get("deviceWidth"),
+                                state.get("viewport_width"),
+                            ),
+                            (
+                                frame_metadata.get("deviceHeight"),
+                                state.get("viewport_height"),
+                            ),
+                            (frame_metadata.get("pageScaleFactor"), 1),
+                            (frame_metadata.get("offsetTop"), 0),
+                        )
+                    )
+                    if event is not None and cdp is not None and coordinates_match:
                         raw = base64.b64decode(event["data"], validate=True)
                         with Image.open(io.BytesIO(raw)) as picture:
                             width, height = picture.size
