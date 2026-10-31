@@ -4,7 +4,7 @@
 
 ## 用户安装：Windows x64 离线完整包
 
-1. 在有网的 Windows x64 机器运行 `python scripts/build_offline.py`，生成 `dist/astrbot_plugin_browser_use-0.1.0-win-x64.zip` 和 SHA256 文件。
+1. 在有网的 Windows x64 机器按下方步骤构建，生成 `dist/astrbot_plugin_browser_use-0.2.0-win-x64.zip` 和 SHA256 文件，同时携带匹配的 AstrBot 后端与 Dashboard 发行构建。
 2. 将 ZIP 复制到无外网机器，解压到任意目录，停止 AstrBot。
 3. 双击解压目录中的 `install.cmd`，选择实际的 AstrBot **data 目录**（其中已有 `plugins` 文件夹）。也可运行 `install.cmd -AstrBotDataDir "D:/AstrBot/data"`。
 4. 启动 AstrBot，插件将自动加载并连接 MCP。插件配置中的 Python、浏览器路径留空即可使用随包环境。
@@ -16,28 +16,54 @@
 
 运行环境为 Windows x64，建议 Windows 10/11。需要 AstrBot `>=4.28,<5`，且提供 `get_llm_tool_manager()`、`mcp_server_runtime_view`、`enable_mcp_server()` 和 `disable_mcp_server()` 接口；已按当前 AstrBot_for_spzx 工作区实现。
 
+**Agent 浏览器还要求 AstrBot_for_spzx 包含 #86 的宿主和 Dashboard 变更。版本号 4.28.1 本身不足以证明兼容。** 核对完整包 `runtime/manifest.json` 中的 `astrbot_revision` 与 `dashboard_sha256`；前端 ZIP 的 `dist/assets/browser-observer-build.json` 记录匹配的后端提交。插件 ZIP 只安装插件，不升级后端或 Dashboard。停止 AstrBot 后另行部署匹配后端，并将 Dashboard ZIP 解压，使用 `python main.py --webui-dir "D:/matching-dashboard/dist"` 启动。不要将前端 ZIP 当作插件上传，也不要覆盖生产数据。先在临时数据目录验收。
+
+前端打包命令还会输出 `*-backend-source.zip` 和校验文件，提供匹配后端源码；该源码包需要已有的兼容 AstrBot Python 环境，不携带宿主全部依赖。将旧 data 目录独立保留，在新代码位置通过 `ASTRBOT_ROOT` 指向其父目录，再选择配套前端。离线插件安装不执行 pip 或浏览器下载。
+
 ## 有网打包
 
 构建脚本需要 Windows x64 和 Python 3.11+（附带 pip）。它会：
 
 - 获取固定版本的官方 Windows embeddable Python 和 Chrome for Testing。
-- 用随包 Python 解析适用于自身版本、Windows x64 的依赖，只接受 wheel，不在无网机器编译。
-- 生成带 SHA256 的全量依赖锁文件，再以 `--no-index --require-hashes` 安装到随包 Python。
+- 使用版本库中的 `scripts/requirements-win-x64.lock` 获取精确版本和 SHA256 匹配的 Windows x64 wheel，不在无网机器编译。升级依赖需显式更新锁文件，并重新完整验收。
+- 以 `--no-index --require-hashes` 安装到随包 Python。
 - 将依赖预装在 `runtime/python/Lib/site-packages`；这是专用嵌入式发行包，不是复制普通 `.venv`。
 - 执行 `pip check`，并使用本机回环网页验证 MCP 握手、工具发现、中文填表、点击、HTML 读取、截图和关闭。
-- 仅在验证成功后输出包含本地安装入口的完整 ZIP。运行时不执行 pip 或任何依赖下载。
+- 构建完整 ZIP，再解压最终 ZIP 验证 MCP、中文表单、连续帧、滚动、新标签和停止/关闭。成功日志出现后才可分发；自检失败的残留 ZIP 不可分发。运行时不执行 pip 或任何依赖下载。
 
 默认固定版本：Browser Use `0.13.11`、Python `3.13.17`、Chrome for Testing `156.0.8078.47`、pip `26.2.2`。Browser Use 选择已发布到 PyPI 的版本；构建时不追踪 `main` 或 `latest`。
 
 ```powershell
-python scripts/build_offline.py
-# Replace pins explicitly when upgrading; every build runs the same smoke test.
-python scripts/build_offline.py --browser-use-version 0.13.11
+# First build/package the matching Dashboard in the AstrBot repository.
+# node node_modules/vue-tsc/bin/vue-tsc.js --noEmit
+# node node_modules/vite/bin/vite.js build
+# python scripts/package_browser_observer_dashboard.py --output D:/delivery/dashboard.zip
+# Use that repository's git rev-parse HEAD and Dashboard ZIP SHA256 below.
+python scripts/build_offline.py --astrbot-revision <40-character-commit> --dashboard-sha256 <64-character-sha256>
 # Build only the small plugin ZIP when a private runtime is already available.
 python scripts/build_offline.py --source-only
 ```
 
 下载缓存在 `.build/downloads`，构建临时环境使用后自动清理。ZIP 中保留 `runtime/requirements.lock`、`runtime/manifest.json`、Python/浏览器及依赖包携带的许可文件。分发前应检查这些组件的再分发许可。
+
+`manifest.json` 包含插件、Python、pip、Browser Use、Chromium 版本、源码哈希、构建输入及来源和匹配前端校验值。校验外层 ZIP：`Get-FileHash .\dist\astrbot_plugin_browser_use-0.2.0-win-x64.zip -Algorithm SHA256`，与 `.zip.sha256` 对照。移动插件安装目录后，留空默认路径会在下次启用时重新定位；安装器仍拒绝覆盖已有插件，`plugin_data` 中的数据保留，但不同浏览器会话使用新 profile。
+
+## 完整宿主验收与故障排查
+
+在具有 AstrBot 开发依赖、`aiohttp playwright psutil` 的测试解释器运行匹配后端仓库中的脚本。它从最终 ZIP 安装到新建的中文/空格目录，启动真实 AstrBot、SQLite、登录、插件管理、完整 Chat.vue 和 Agent 工具执行；仅以本地 OpenAI 兼容 fixture 代替模型服务。本机复用随包 Chromium，不下载测试浏览器。`--evidence-dir` 必须尚不存在。
+
+```powershell
+python scripts/browser_observer_acceptance.py --plugin-zip D:/delivery/astrbot_plugin_browser_use-0.2.0-win-x64.zip --dashboard-dir D:/delivery/dist --evidence-dir D:/temporary/new-acceptance
+```
+
+该命令在 **AstrBot 仓库** 执行，生成截图、宿主日志、模型请求和逐项结果。测试为宿主进程注入临时的外部 DNS/套接字拦截，并设置失效的外网 HTTP 代理，网页/模型均使用回环；这是模拟无外网，不等于系统防火墙或断开网络的干净目标机。被拒绝的更新查询可能出现在日志中。实际无网 Windows 目标机和真实 vLLM 工具调用仍需分别验收。不要把模型 fixture 成功当作特定 vLLM 模型兼容证明。
+
+- 入口缺失：核对 Dashboard 构建校验值和后端提交；清除旧前端缓存并重新登录。
+- `runtime_unavailable`：检查完整 ZIP、独立解释器、Chromium 和插件加载日志；源码小包没有二进制环境。
+- `busy`：在占用聊天关闭浏览器；切聊天不会转交登录态。
+- `disabled`：启用插件后重新发起任务；停止后的会话须先关闭浏览器。
+- 401/403：重新登录并使用当前用户拥有的聊天，不手工替换 `chat_id`。
+- 离线启动失败：勿执行 pip 修补宿主环境；核对 SHA256、安装路径及安全设置是否放行私有 Python，保留日志后在有网构建机重建完整包。
 
 ## 源码开发或复用现成环境
 

@@ -12,7 +12,6 @@ import sys
 import tempfile
 import urllib.request
 import zipfile
-from email.parser import BytesParser
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +44,7 @@ def download(url: str, cache_dir: Path) -> Path:
         OSError: The download or local write fails.
     """
     destination = cache_dir / url.rsplit("/", 1)[-1]
+    destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.is_file():
         print(f"Using cached {destination.name}", flush=True)
         return destination
@@ -91,19 +91,28 @@ def main() -> None:
         RuntimeError: The builder is not running on Windows x64.
         Exception: A download, wheel resolution, runtime check, or packaging fails.
     """
+    sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--browser-use-version", default="0.13.11")
     parser.add_argument("--python-version", default="3.13.17")
     parser.add_argument("--chrome-version", default="156.0.8078.47")
     parser.add_argument("--pip-version", default="26.2.2")
     parser.add_argument("--source-only", action="store_true")
+    parser.add_argument("--astrbot-revision", help="Matching AstrBot Git commit SHA.")
+    parser.add_argument("--dashboard-sha256", help="Matching Dashboard ZIP SHA256.")
     args = parser.parse_args()
+    version = next(
+        line.split(":", 1)[1].strip().removeprefix("v")
+        for line in (ROOT / "metadata.yaml").read_text(encoding="utf-8").splitlines()
+        if line.startswith("version:")
+    )
     output_dir = ROOT / "dist"
     output_dir.mkdir(exist_ok=True)
-    source_zip = output_dir / f"{ROOT.name}-0.1.0-source.zip"
+    source_zip = output_dir / f"{ROOT.name}-{version}-source.zip"
     with zipfile.ZipFile(source_zip, "w", zipfile.ZIP_DEFLATED) as archive:
         source_paths = [ROOT / name for name in SOURCE_FILES]
         source_paths.extend((ROOT / "scripts").glob("*.py"))
+        source_paths.append(ROOT / "scripts/requirements-win-x64.lock")
         for path in source_paths:
             archive.write(path, Path(ROOT.name) / path.relative_to(ROOT))
     if args.source_only:
@@ -111,6 +120,11 @@ def main() -> None:
         return
     if sys.platform != "win32" or platform.machine().lower() not in {"amd64", "x86_64"}:
         raise RuntimeError("Build this package on Windows x64.")
+    if not args.astrbot_revision or not args.dashboard_sha256:
+        parser.error("Full builds require --astrbot-revision and --dashboard-sha256.")
+    for value, length in ((args.astrbot_revision, 40), (args.dashboard_sha256, 64)):
+        if len(value) != length or any(c not in "0123456789abcdef" for c in value):
+            parser.error("Revision and Dashboard checksum must be lowercase hex.")
     for value in (
         args.browser_use_version,
         args.python_version,
@@ -131,7 +145,7 @@ def main() -> None:
     chrome_archive = download(
         f"https://storage.googleapis.com/chrome-for-testing-public/{args.chrome_version}/"
         "win64/chrome-win64.zip",
-        cache_dir,
+        cache_dir / args.chrome_version,
     )
     with tempfile.TemporaryDirectory(prefix="offline-", dir=build_dir) as temporary:
         staging = Path(temporary).resolve()
@@ -168,6 +182,7 @@ def main() -> None:
                 "pip",
                 "--disable-pip-version-check",
                 "download",
+                "--index-url=https://pypi.org/simple",
                 "--no-deps",
                 "--only-binary=:all:",
                 "--dest",
@@ -189,30 +204,24 @@ def main() -> None:
                 "pip",
                 "--disable-pip-version-check",
                 "download",
+                "--index-url=https://pypi.org/simple",
                 "--only-binary=:all:",
                 "--dest",
                 str(wheelhouse),
-                f"browser-use=={args.browser_use_version}",
+                "--require-hashes",
+                "-r",
+                str(ROOT / "scripts/requirements-win-x64.lock"),
             ],
         )
-        requirements = []
         inputs = {}
         for wheel in sorted(wheelhouse.glob("*.whl")):
-            with zipfile.ZipFile(wheel) as archive:
-                metadata_name = next(
-                    name
-                    for name in archive.namelist()
-                    if name.endswith(".dist-info/METADATA")
-                )
-                metadata = BytesParser().parsebytes(archive.read(metadata_name))
             with wheel.open("rb") as stream:
                 digest = hashlib.file_digest(stream, "sha256").hexdigest()
-            requirements.append(
-                f"{metadata['Name']}=={metadata['Version']} --hash=sha256:{digest}"
-            )
             inputs[wheel.name] = digest
         lock_path = runtime_dir / "requirements.lock"
-        lock_path.write_text("\n".join(requirements) + "\n", encoding="utf-8")
+        shutil.copy2(ROOT / "scripts/requirements-win-x64.lock", lock_path)
+        if f"browser-use=={args.browser_use_version} " not in lock_path.read_text():
+            raise ValueError("Browser Use version must match the checked-in lock.")
         run_step(
             [
                 str(python_exe),
@@ -248,7 +257,24 @@ def main() -> None:
                     "python": args.python_version,
                     "browser_use": args.browser_use_version,
                     "chrome": args.chrome_version,
+                    "pip": args.pip_version,
+                    "plugin_version": version,
+                    "astrbot_revision": args.astrbot_revision,
+                    "dashboard_sha256": args.dashboard_sha256,
+                    "source_sha256": {
+                        path.relative_to(plugin).as_posix(): hashlib.sha256(
+                            path.read_bytes()
+                        ).hexdigest()
+                        for path in sorted(plugin.rglob("*"))
+                        if path.is_file()
+                        and "runtime" not in path.relative_to(plugin).parts
+                    },
                     "inputs_sha256": inputs,
+                    "input_urls": {
+                        python_archive.name: f"https://www.python.org/ftp/python/{args.python_version}/python-{args.python_version}-embed-amd64.zip",
+                        chrome_archive.name: f"https://storage.googleapis.com/chrome-for-testing-public/{args.chrome_version}/win64/chrome-win64.zip",
+                        "wheels": "https://pypi.org/simple (exact artifacts in requirements.lock)",
+                    },
                 },
                 indent=2,
             ),
@@ -262,7 +288,7 @@ def main() -> None:
                 str(plugin),
             ],
         )
-        output_path = output_dir / f"{ROOT.name}-0.1.0-win-x64.zip"
+        output_path = output_dir / f"{ROOT.name}-{version}-win-x64.zip"
         with zipfile.ZipFile(
             output_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6
         ) as archive:
@@ -271,6 +297,19 @@ def main() -> None:
             for path in sorted(plugin.rglob("*")):
                 if path.is_file() and "__pycache__" not in path.parts:
                     archive.write(path, path.relative_to(staging))
+        output_path.with_suffix(".zip.sha256").unlink(missing_ok=True)
+        # Verify the exact distribution bytes, rather than only its staging tree.
+        extracted = staging / "final-package"
+        with zipfile.ZipFile(output_path) as archive:
+            archive.extractall(extracted)
+        run_step(
+            [
+                sys.executable,
+                str(extracted / ROOT.name / "scripts/smoke_test.py"),
+                "--plugin-dir",
+                str(extracted / ROOT.name),
+            ]
+        )
         with output_path.open("rb") as stream:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
         output_path.with_suffix(".zip.sha256").write_text(
