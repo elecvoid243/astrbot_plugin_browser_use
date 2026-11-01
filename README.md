@@ -2,6 +2,14 @@
 
 随 AstrBot 插件生命周期启动、停止本地 Browser Use MCP。AstrBot 继续作为主 Agent，调用已有的 vLLM / OpenAI 兼容模型；Browser Use 只提供浏览器工具。
 
+## 多账户 Chat 消费兼容
+
+多账户宿主只向普通账户开放实际带 `browser-owned-chat-v1` 守卫标记的处理器。
+请同步部署匹配的 AstrBot 后端、Dashboard 和本插件；旧版插件不能仅凭相同 URL 获得消费权限。
+现有观察处理器仍核对真实会话所有者、当前浏览器归属及 generation/session/lease，
+管理员日常 Chat 也不能通过状态、截图、订阅或停止入口接管另一账户的浏览器。
+这个标记没有增加工具权限或独立执行沙箱；非 Dashboard 的工具生命周期保持原有语义。
+
 ## 用户安装：Windows x64 离线完整包
 
 1. 在有网的 Windows x64 机器按下方步骤构建，生成 `dist/astrbot_plugin_browser_use-0.2.0-win-x64.zip` 和 SHA256 文件，同时携带匹配的 AstrBot 后端与 Dashboard 发行构建。

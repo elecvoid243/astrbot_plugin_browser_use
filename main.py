@@ -344,6 +344,10 @@ class BrowserUsePlugin(Star):
                 data={"reason": "runtime_unavailable"},
             )
 
+    # The host admits only the actual ownership-aware observer, including old
+    # installations where an unguarded handler may still occupy the same route.
+    browser_observation.__astrbot_chat_guard__ = "browser-owned-chat-v1"
+
     async def browser_control(self, operation, bridge, state, owner, lease, token):
         """Revoke queued calls and wait for real execution/browser cleanup.
 
