@@ -132,7 +132,7 @@ Dashboard 扩展接口（沿用 AstrBot 登录鉴权）：
 
 私有桥只绑定 `127.0.0.1` 的随机端口，使用本次启用的随机 Bearer 凭据和运行代次校验；发现文件仅存放端口和代次。公共响应不包含 CDP 地址或桥接凭据。快照通过 `Page.captureScreenshot` 读取当前视口（1280×720、JPEG quality 65），不调用 DOM 状态刷新或修改 Agent 焦点。标签变化时丢弃该次结果并要求刷新。插件退出时关闭桥并移除其发现文件。
 
-只读观测通过同一 BrowserSession 的 `Page.startScreencast` 取帧，JPEG quality 65、最大 1280×720、压缩图片最多 512 KiB、单事件最多 768 KiB；元数据拒绝超过 8192 字符的 URL 或 1024 字符的标题。发布间隔至少 250 ms（最多约 4 Hz，静止页面不强制产生新帧）。采集不调用 `browser_get_state` 或其他 MCP 工具，不刷新 DOM 状态或改变焦点。每个代次最多 4 个订阅，每个订阅在私有桥和宿主代理各保留一个待发画面，并为动作保留独立有界缓冲，慢客户端覆盖旧画面；CDP 确认独立执行并有界。私有桥写入超过 2 秒就关闭该订阅。人工接管使用下述专用鉴权通道，人工期间按同样帧率上限复用一致性截图反馈。
+只读观测通过同一 BrowserSession 的 `Page.startScreencast` 取帧，JPEG quality 65、最大 1280×720、压缩图片最多 512 KiB、单事件最多 768 KiB；元数据拒绝超过 8192 字符的 URL 或 1024 字符的标题。只读发布间隔至少 250 ms（最多约 4 Hz，静止页面不强制产生新帧）。采集不调用 `browser_get_state` 或其他 MCP 工具，不刷新 DOM 状态或改变焦点。每个代次最多 4 个订阅，每个订阅在私有桥和宿主代理各保留一个待发画面，并为动作保留独立有界缓冲，慢客户端覆盖旧画面；CDP 确认独立执行并有界。私有桥写入超过 2 秒就关闭该订阅。人工接管使用下述专用鉴权通道，人工期间按同样帧率上限复用一致性截图反馈。
 
 ## 验证
 
@@ -194,10 +194,21 @@ control epoch, input ordering and actual target identity. It accepts only typed
 click, heartbeat and release operations. Agent tools and new model turns reject
 while human control or paused admission is active. No arbitrary CDP/script proxy
 is exposed. Human control uses validated viewport JPEGs at no more than the
-existing four-frame-per-second limit, over the existing SSE observation stream.
+ten-capture-per-second target while human control is active (read-only remains four Hz), over the existing SSE observation stream.
 Control metadata cannot overwrite the only pending changed frame of a static page.
 
 The exact protocol is documented in the matching AstrBot source at
 `docs/en/dev/browser-manual-control.md` and `docs/zh/dev/browser-manual-control.md`.
-Keyboard/composition/paste, scrolling/double-click and full lifecycle recovery are
-subsequent H03–H05 work; final offline-package acceptance belongs to H06.
+Keyboard/composition/paste (H03) and scrolling/double-click feedback (H04) are implemented. Full lifecycle recovery remains H05; final offline-package acceptance belongs to H06.
+
+
+H04 adds `pointer_input_version: 1`, typed bounded wheel input, native double-click counts,
+and nested-scroll `position_revision` validation. Human snapshots retain the existing
+size/queue limits and target up to 10 captures/second. `applied_input_id` distinguishes
+input acknowledgements from a subsequently loaded image; human timeline entries contain
+categories only. Legacy single-click clients and read-only observation remain compatible.
+
+Stale wheel samples receive `status: stale`, consume their ordered ID without
+CDP dispatch, and keep human ownership while the next image synchronizes. The
+client displays the rejection and does not replay that gesture. Other uncertain
+or invalid commands retain the existing fail-closed behavior.

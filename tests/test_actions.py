@@ -521,6 +521,44 @@ async def test_manual_admission_ordering_target_and_explicit_handback(observed_s
                     assert response.status == 200
                     assert (await response.json())["status"] == "applied"
             assert dispatch.await_count == 2  # One press/release, even after retry.
+            state["position_revision"] = 3
+            wheel = {
+                **click,
+                "operation": "wheel",
+                "input_id": 2,
+                "delta_x": 50,
+                "delta_y": -100,
+                "target": {**click["target"], "position_revision": 2},
+            }
+            async with http.post(url, json=wheel) as response:
+                assert response.status == 200
+                assert (await response.json())["status"] == "stale"
+            assert dispatch.await_count == 2
+            wheel["target"]["position_revision"] = 3
+            wheel["input_id"] = 3
+            for _ in range(2):
+                async with http.post(url, json=wheel) as response:
+                    assert response.status == 200
+            assert dispatch.await_count == 3
+            assert dispatch.await_args.kwargs["params"]["type"] == "mouseWheel"
+            assert dispatch.await_args.kwargs["params"]["deltaX"] == 50
+            async with http.post(
+                url, json={**click, "input_id": 4, "click_count": 2}
+            ) as response:
+                assert response.status == 200
+            assert dispatch.await_args.kwargs["params"]["clickCount"] == 2
+            assert observer.applied_input_id == 4
+            assert all(action["actor"] == "human" for action in observer.recent_actions)
+            for delta in (float("inf"), 2049, True):
+                async with http.post(
+                    url, json={**wheel, "input_id": 5, "delta_y": delta}
+                ) as response:
+                    assert response.status == 400
+            dispatch.side_effect = RuntimeError("Detached target")
+            async with http.post(url, json={**wheel, "input_id": 5}) as response:
+                assert (await response.json())["status"] == "uncertain"
+            assert observer.control_mode == "paused"
+            assert observer.applied_input_id == 4
             async with http.post(
                 url,
                 json={**identity, "operation": "disconnect", "control_epoch": epoch},
@@ -1015,3 +1053,17 @@ async def test_key_release_deadline_is_shared_across_lost_keys(observed_server):
         await asyncio.wait_for(observer.release_keys(), 4)
     assert silent.await_count == 3 and len(observer._held_keys) == 3
     assert observer.control_mode == "paused"
+
+
+async def test_captured_input_ack_cannot_cross_control_epoch(observed_server):
+    """Keep in-progress pixels tied to their pre-capture input/epoch pair.
+
+    Args:
+        observed_server: Isolated runtime wrapper and observation bridge.
+    """
+    _, observer, _ = observed_server
+    observer.control_epoch = 8
+    observer.applied_input_id = 2
+    frame = observer.publish("frame", {"control_epoch": 6, "applied_input_id": 9})
+    assert frame["control_epoch"] == 6
+    assert frame["applied_input_id"] == 9

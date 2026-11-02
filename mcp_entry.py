@@ -359,6 +359,7 @@ class LocalBrowserServer(BrowserUseServer):
                 )
             }
             observer.highlight.update(
+                position_revision=state.get("position_revision"),
                 action_id=observer.current_action["action_id"],
                 x=x,
                 y=y,

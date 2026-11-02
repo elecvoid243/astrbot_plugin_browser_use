@@ -24,6 +24,22 @@ from observation_queue import ACTION_LIMIT, ObservationQueue
 MAX_IMAGE_BYTES = 512 * 1024
 MAX_EVENT_BYTES = 768 * 1024
 FRAME_INTERVAL = 0.25
+HUMAN_FRAME_INTERVAL = 0.1
+# A scroll revision also covers nested scrollers without treating animation frames
+# as new targets. The listener is installed once in each actual page document.
+PAGE_STATE_EXPRESSION = """JSON.stringify((() => {
+const key = Symbol.for('astrbot.browser.position');
+if (!window[key]) {
+  const position = {revision: 0};
+  Object.defineProperty(window, key, {value: position});
+  addEventListener('scroll', () => position.revision++, true);
+  addEventListener('resize', () => position.revision++, true);
+}
+return {url:location.href,title:document.title,
+document_id:String(performance.timeOrigin),viewport_width:innerWidth,
+viewport_height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,
+position_revision:window[key].revision};
+})())"""
 
 
 class BrowserObserver:
@@ -61,6 +77,7 @@ class BrowserObserver:
         self.control_mode = "agent"
         self.owner = None
         self.control_epoch = 0
+        self.applied_input_id = 0
         self.human = None
         self._human_expiry = None
         self._held_keys = {}
@@ -114,6 +131,8 @@ class BrowserObserver:
             "control_epoch": self.control_epoch,
             "manual_control_version": 1,
             "keyboard_input_version": 1,
+            "pointer_input_version": 1,
+            "applied_input_id": self.applied_input_id,
             "url": "",
             "title": "",
             "width": 0,
@@ -126,7 +145,7 @@ class BrowserObserver:
         cdp = await browser.get_or_create_cdp_session(target_id=target, focus=False)
         info = await cdp.cdp_client.send.Runtime.evaluate(
             params={
-                "expression": "JSON.stringify({url:location.href,title:document.title,document_id:String(performance.timeOrigin),viewport_width:innerWidth,viewport_height:innerHeight,scroll_x:scrollX,scroll_y:scrollY})",
+                "expression": PAGE_STATE_EXPRESSION,
                 "returnByValue": True,
             },
             session_id=cdp.session_id,
@@ -148,6 +167,7 @@ class BrowserObserver:
                 "viewport_height",
                 "scroll_x",
                 "scroll_y",
+                "position_revision",
             )
         ):
             self.highlight = None
@@ -239,6 +259,7 @@ class BrowserObserver:
                 if self.execution_state != "active":
                     raise web.HTTPConflict(text="A stopped Agent cannot be taken over.")
                 self.control_mode = "acquiring"
+                self.applied_input_id = 0
                 self.control_epoch += 1
                 try:
                     await self.release_keys()
@@ -336,7 +357,7 @@ class BrowserObserver:
                                 text="Fresh browser observation failed."
                             )
                         self.control_mode = "agent"
-                elif operation in {"click", "key", "text", "reset_keys"}:
+                elif operation in {"click", "wheel", "key", "text", "reset_keys"}:
                     number = body.get("input_id")
                     if type(number) is not int or number < 1:
                         raise web.HTTPBadRequest(text="Invalid input number.")
@@ -348,6 +369,11 @@ class BrowserObserver:
                     target = body.get("target", {})
                     if operation != "reset_keys" and (
                         cdp is None
+                        or (
+                            "position_revision" in target
+                            and target["position_revision"]
+                            != state.get("position_revision")
+                        )
                         or any(
                             target.get(key) != state.get(key)
                             for key in (
@@ -361,11 +387,25 @@ class BrowserObserver:
                         )
                     ):
                         await self.release_keys()
+                        if operation == "wheel":
+                            # Scroll animation can outlive a displayed frame. Reject
+                            # this replaceable sample, consume its ID, and keep the
+                            # explicit human owner while the client resynchronizes.
+                            self.human["last_input"] = number
+                            self.human["last_ack"] = {
+                                "operation": operation,
+                                "input_id": number,
+                                "status": "stale",
+                                "control_epoch": self.control_epoch,
+                                "state": state,
+                            }
+                            self.publish("state", state)
+                            return web.json_response(self.human["last_ack"])
                         raise web.HTTPConflict(
                             text="Displayed target expired; refresh observation."
                         )
                     params = None
-                    if operation == "click":
+                    if operation in {"click", "wheel"}:
                         x, y = body.get("x"), body.get("y")
                         if (
                             any(
@@ -375,7 +415,21 @@ class BrowserObserver:
                             or not 0 <= x < state["viewport_width"]
                             or not 0 <= y < state["viewport_height"]
                         ):
-                            raise web.HTTPBadRequest(text="Invalid click coordinates.")
+                            raise web.HTTPBadRequest(
+                                text="Invalid pointer coordinates."
+                            )
+                        if operation == "click" and (
+                            type(body.get("click_count", 1)) is not int
+                            or body.get("click_count", 1) not in (1, 2)
+                        ):
+                            raise web.HTTPBadRequest(text="Invalid click count.")
+                        if operation == "wheel" and any(
+                            type(body.get(key)) not in (int, float)
+                            or not math.isfinite(body[key])
+                            or abs(body[key]) > 2048
+                            for key in ("delta_x", "delta_y")
+                        ):
+                            raise web.HTTPBadRequest(text="Invalid wheel delta.")
                     elif operation == "text":
                         text = body.get("text")
                         if (
@@ -468,13 +522,27 @@ class BrowserObserver:
                                             "x": x,
                                             "y": y,
                                             "button": "left",
-                                            "clickCount": 1,
+                                            "clickCount": body.get("click_count", 1),
                                         },
                                         session_id=cdp.session_id,
                                     ),
                                     3,
                                 )
                             self._held_mouse = None
+                        elif operation == "wheel":
+                            await asyncio.wait_for(
+                                cdp.cdp_client.send.Input.dispatchMouseEvent(
+                                    params={
+                                        "type": "mouseWheel",
+                                        "x": x,
+                                        "y": y,
+                                        "deltaX": body["delta_x"],
+                                        "deltaY": body["delta_y"],
+                                    },
+                                    session_id=cdp.session_id,
+                                ),
+                                3,
+                            )
                         elif operation == "reset_keys":
                             await self.release_keys()
                         elif operation == "text":
@@ -501,12 +569,18 @@ class BrowserObserver:
                         with contextlib.suppress(Exception):
                             await self.release_keys()
                         return web.json_response(self.human["last_ack"])
-                    if operation in {"text", "key"}:
+                    self.applied_input_id = number
+                    if operation in {"text", "key", "click", "wheel"}:
                         # The timeline contains categories only, including for passwords.
                         self.recent_actions.append(
                             {
                                 "action_id": uuid4().hex,
-                                "kind": "type",
+                                "kind": "scroll"
+                                if operation == "wheel"
+                                else "click"
+                                if operation == "click"
+                                else "type",
+                                "actor": "human",
                                 "status": "succeeded",
                                 "input_category": body.get("source", "keyboard"),
                                 "browser_session_id": browser.id,
@@ -753,9 +827,11 @@ class BrowserObserver:
             **state,
             "execution_state": self.execution_state,
             "control_mode": self.control_mode,
-            "control_epoch": self.control_epoch,
+            "control_epoch": state.get("control_epoch", self.control_epoch),
             "manual_control_version": 1,
             "keyboard_input_version": 1,
+            "pointer_input_version": 1,
+            "applied_input_id": state.get("applied_input_id", self.applied_input_id),
             **self.action_state(state.get("browser_session_id")),
             "type": kind,
             "sequence": self.sequence,
@@ -791,7 +867,7 @@ class BrowserObserver:
         )
         after = await cdp.cdp_client.send.Runtime.evaluate(
             params={
-                "expression": "JSON.stringify({url:location.href,title:document.title,document_id:String(performance.timeOrigin),viewport_width:innerWidth,viewport_height:innerHeight,scroll_x:scrollX,scroll_y:scrollY})",
+                "expression": PAGE_STATE_EXPRESSION,
                 "returnByValue": True,
             },
             session_id=cdp.session_id,
@@ -806,10 +882,18 @@ class BrowserObserver:
                 "viewport_height",
                 "scroll_x",
                 "scroll_y",
+                "position_revision",
             )
         }:
             raise web.HTTPConflict(text="Page changed; refresh observation.")
         raw = base64.b64decode(shot["data"])
+        with Image.open(io.BytesIO(raw)) as picture:
+            if picture.width > 1280 or picture.height > 720:
+                picture.thumbnail((1280, 720))
+                encoded = io.BytesIO()
+                picture.convert("RGB").save(encoded, format="JPEG", quality=65)
+                raw = encoded.getvalue()
+                shot["data"] = base64.b64encode(raw).decode("ascii")
         if len(raw) > MAX_IMAGE_BYTES:
             raise web.HTTPRequestEntityTooLarge(
                 max_size=MAX_IMAGE_BYTES, actual_size=len(raw)
@@ -853,6 +937,8 @@ class BrowserObserver:
                     "control_epoch": self.control_epoch,
                     "manual_control_version": 1,
                     "keyboard_input_version": 1,
+                    "pointer_input_version": 1,
+                    "applied_input_id": self.applied_input_id,
                 },
                 headers={"Cache-Control": "no-store"},
             )
@@ -976,7 +1062,7 @@ class BrowserObserver:
                 continue
 
     async def capture(self):
-        """Follow Agent focus and publish bounded screencast images at most 4 Hz.
+        """Follow Agent focus with bounded human and read-only capture rates.
 
         Frame callbacks never await CDP: its receive loop also resolves commands.
         The acknowledgement queue bounds work even if the CDP connection stalls.
@@ -1159,7 +1245,11 @@ class BrowserObserver:
                         )
                     active = None
                     pending = None
-                await asyncio.sleep(FRAME_INTERVAL)
+                await asyncio.sleep(
+                    HUMAN_FRAME_INTERVAL
+                    if self.control_mode == "human"
+                    else FRAME_INTERVAL
+                )
         finally:
             if active is not None:
                 cdp = active[1]
