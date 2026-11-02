@@ -388,6 +388,8 @@ class BrowserUsePlugin(Star):
                         self.logger.info(
                             "Browser control acquisition requested; Agent admission paused."
                         )
+                    revision = self._disable_revision
+                    manual_lease = self._lease
                     async with aiohttp.ClientSession(
                         timeout=aiohttp.ClientTimeout(total=20)
                     ) as client:
@@ -406,6 +408,19 @@ class BrowserUsePlugin(Star):
                                     await response.text(), status_code=response.status
                                 )
                             result = await response.json()
+                    # Disable and cancellation can run while the private request
+                    # settles. Its old response cannot reopen Agent admission.
+                    if (
+                        not self._enabled
+                        or self._stopped
+                        or self._disable_revision != revision
+                        or self._lease != manual_lease
+                        or self._bridge_token != token
+                        or self._owner != owner
+                    ):
+                        return error_response(
+                            "Browser ownership expired.", status_code=409
+                        )
                     self._control_epoch = result["control_epoch"]
                     observation = result.pop("agent_observation", "")
                     if command["operation"] == "release":

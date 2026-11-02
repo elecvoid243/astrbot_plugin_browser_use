@@ -200,6 +200,121 @@ async def test_observation_reports_availability_without_starting_browser(
     assert json.loads(unavailable.body)["data"]["reason"] == "runtime_unavailable"
 
 
+@pytest.mark.parametrize("transition", ["disable", "cancel", "restart"])
+async def test_late_handback_response_cannot_restore_admission(
+    plugin_class, monkeypatch, tmp_path, transition
+):
+    """Reject a private response invalidated while its host request was waiting.
+
+    Args:
+        plugin_class: Isolated plugin with the actual host request implementation.
+        monkeypatch: Authenticated request context binding.
+        tmp_path: Disposable private bridge discovery record.
+        transition: Terminal or generation change during the pending handback.
+    """
+    import sys
+
+    plugin = plugin_class(
+        SimpleNamespace(
+            get_db=lambda: SimpleNamespace(
+                get_platform_session_by_id=AsyncMock(
+                    return_value=SimpleNamespace(creator="alice", platform_id="webchat")
+                )
+            )
+        ),
+        {},
+    )
+    plugin._enabled = True
+    plugin._owner = "trusted-owner"
+    plugin._webchat_owner = ("alice", "chat")
+    plugin._manual_blocked = True
+    resumed = []
+    plugin._agent_pause = SimpleNamespace(resume=lambda *args: resumed.append(args))
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def identity(request):
+        """Return private lifetime metadata without page access.
+
+        Args:
+            request: Internal identity request.
+
+        Returns:
+            Current test lifetime.
+        """
+        return web.json_response(
+            {"generation": "run", "browser_session_id": "browser", "available": True}
+        )
+
+    async def manual(request):
+        """Hold a successful handback response until a terminal transition.
+
+        Args:
+            request: Authenticated internal handback.
+
+        Returns:
+            A successful but now stale private acknowledgement.
+        """
+        entered.set()
+        await finish.wait()
+        return web.json_response(
+            {
+                "control_epoch": 2,
+                "agent_observation": "fresh",
+                "state": {"control_mode": "agent"},
+            }
+        )
+
+    app = web.Application()
+    app.router.add_get("/identity", identity)
+    app.router.add_post("/manual", manual)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    plugin._bridge_file = tmp_path / "bridge.json"
+    plugin._bridge_file.write_text(
+        json.dumps(
+            {"generation": "run", "port": site._server.sockets[0].getsockname()[1]}
+        )
+    )
+    monkeypatch.setattr(
+        sys.modules[plugin_class.__module__],
+        "request",
+        SimpleNamespace(
+            username="alice",
+            query={
+                "chat_id": "chat",
+                "generation": "run",
+                "browser_session_id": "browser",
+            },
+            path="/browser-use/manual",
+            browser_control={
+                "operation": "release",
+                "client_id": "client",
+                "control_epoch": 1,
+            },
+        ),
+    )
+    try:
+        pending = asyncio.create_task(plugin.browser_observation())
+        await asyncio.wait_for(entered.wait(), 2)
+        if transition == "disable":
+            plugin._enabled = False
+            plugin._disable_revision += 1
+        elif transition == "cancel":
+            plugin._stopped = True
+        else:
+            plugin._bridge_token = "new-runtime"
+            plugin._lease += 1
+        finish.set()
+        response = await pending
+        assert response.status_code == 409
+        assert plugin._manual_blocked and not resumed
+    finally:
+        finish.set()
+        await runner.cleanup()
+
+
 @pytest.mark.parametrize("transition", ["stop", "same_owner_reopen"])
 async def test_queued_calls_do_not_cross_a_lifetime(plugin_class, transition):
     """Reject queued work even when a new lifetime has the same owner.

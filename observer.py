@@ -83,6 +83,8 @@ class BrowserObserver:
         self._held_keys = {}
         self._held_mouse = None
         self.pending_browser_events = []
+        self._snapshot_lock = asyncio.Lock()
+        self._snapshot_session = None
 
     async def start(self) -> None:
         """Bind an ephemeral loopback port and publish its discovery record.
@@ -180,44 +182,67 @@ class BrowserObserver:
         return browser, cdp, state
 
     async def release_keys(self):
-        """Release keys on their original CDP session before changing admission.
+        """Release held input on its original CDP session before changing admission.
 
         Raises:
-            HTTPConflict: Some keys remain unconfirmed after all releases are attempted.
-                Admission stays paused and failed keys are retained for retry or close.
+            HTTPConflict: Input release remains unconfirmed after all attempts.
+                Admission stays paused and failed input is retained for retry or close.
         """
         keys = list(self._held_keys.items())
         # Releases are independent. Share one bounded deadline even if many targets died.
-        results = await asyncio.gather(
-            *(
+        releases = [
+            asyncio.wait_for(
+                cdp.cdp_client.send.Input.dispatchKeyEvent(
+                    params={
+                        **params,
+                        "type": "keyUp",
+                        "modifiers": 0,
+                        "text": "",
+                        "unmodifiedText": "",
+                        "autoRepeat": False,
+                    },
+                    session_id=cdp.session_id,
+                ),
+                3,
+            )
+            for _, (cdp, params) in keys
+        ]
+        mouse = self._held_mouse
+        if mouse is not None:
+            cdp, _, _ = mouse
+            # Release outside the page so an uncertain press cannot become a
+            # second click/submit during disconnect cleanup.
+            releases.append(
                 asyncio.wait_for(
-                    cdp.cdp_client.send.Input.dispatchKeyEvent(
+                    cdp.cdp_client.send.Input.dispatchMouseEvent(
                         params={
-                            **params,
-                            "type": "keyUp",
-                            "modifiers": 0,
-                            "text": "",
-                            "unmodifiedText": "",
-                            "autoRepeat": False,
+                            "type": "mouseReleased",
+                            "x": -1,
+                            "y": -1,
+                            "button": "left",
+                            "clickCount": 1,
                         },
                         session_id=cdp.session_id,
                     ),
                     3,
                 )
-                for _, (cdp, params) in keys
-            ),
-            return_exceptions=True,
-        )
+            )
+        results = await asyncio.gather(*releases, return_exceptions=True)
         failed = False
-        for (code, _), result in zip(keys, results):
+        for (code, _), result in zip(keys, results[: len(keys)]):
             if isinstance(result, BaseException):
                 failed = True
             else:
                 self._held_keys.pop(code, None)
+        if mouse is not None:
+            if isinstance(results[-1], BaseException):
+                failed = True
+            elif self._held_mouse is mouse:
+                self._held_mouse = None
         if failed:
             self.control_mode = "paused"
             raise web.HTTPConflict(
-                text="Key release unconfirmed; browser remains paused. Close the browser before continuing."
+                text="Input release unconfirmed; browser remains paused. Close the browser before continuing."
             )
 
     async def manual(self, request):
@@ -323,22 +348,6 @@ class BrowserObserver:
                     else:
                         with contextlib.suppress(Exception):
                             await self.release_keys()
-                    if self._held_mouse is not None:
-                        cdp, x, y = self._held_mouse
-                        await asyncio.wait_for(
-                            cdp.cdp_client.send.Input.dispatchMouseEvent(
-                                params={
-                                    "type": "mouseReleased",
-                                    "x": x,
-                                    "y": y,
-                                    "button": "left",
-                                    "clickCount": 1,
-                                },
-                                session_id=cdp.session_id,
-                            ),
-                            3,
-                        )
-                        self._held_mouse = None
                     # Existing element indices cannot survive human page changes.
                     browser._cached_browser_state_summary = None
                     browser._cached_selector_map = {}
@@ -840,6 +849,13 @@ class BrowserObserver:
             queue.put_nowait(event)
         return event
 
+    async def _close_snapshot_session(self):
+        """Release capture resources while the snapshot lock is held."""
+        cached, self._snapshot_session = self._snapshot_session, None
+        if cached is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(cached[2].stop(), 1)
+
     async def capture_snapshot(self, browser, cdp, state):
         """Capture pixels with the same document and viewport consistency checks.
 
@@ -857,22 +873,54 @@ class BrowserObserver:
         """
         state = dict(state)
         captured_at = time.time()
-        shot = await cdp.cdp_client.send.Page.captureScreenshot(
-            params={
-                "format": "jpeg",
-                "quality": 65,
-                "captureBeyondViewport": False,
-            },
-            session_id=cdp.session_id,
-        )
-        after = await cdp.cdp_client.send.Runtime.evaluate(
-            params={
-                "expression": PAGE_STATE_EXPRESSION,
-                "returnByValue": True,
-            },
-            session_id=cdp.session_id,
-        )
-        if json.loads(after["result"]["value"]) != {
+        async with self._snapshot_lock:
+            if (
+                self._closed
+                or self.server.browser_session is not browser
+                or browser.agent_focus_target_id != state["tab_id"]
+            ):
+                raise web.HTTPConflict(text="Browser capture lifetime expired.")
+            cached = self._snapshot_session
+            if cached is not None and (
+                cached[0] is not browser or cached[1] != state["tab_id"]
+            ):
+                await self._close_snapshot_session()
+                cached = None
+            try:
+                if cached is None:
+                    from cdp_use import CDPClient
+
+                    # Keep capture outside the Agent's CDP session pool: upstream
+                    # may select any pooled session for held-key input. Replacing
+                    # this read-only connection must never detach an input session.
+                    client = CDPClient(browser.cdp_url)
+                    self._snapshot_session = (browser, state["tab_id"], client, None)
+                    await asyncio.wait_for(client.start(), 2)
+                    attached = await asyncio.wait_for(
+                        client.send.Target.attachToTarget(
+                            params={"targetId": state["tab_id"], "flatten": True}
+                        ),
+                        2,
+                    )
+                    cached = (browser, state["tab_id"], client, attached["sessionId"])
+                    self._snapshot_session = cached
+                shot = await cached[2].send.Page.captureScreenshot(
+                    params={
+                        "format": "jpeg",
+                        "quality": 65,
+                        "captureBeyondViewport": False,
+                    },
+                    session_id=cached[3],
+                )
+                after = await cached[2].send.Runtime.evaluate(
+                    params={"expression": PAGE_STATE_EXPRESSION, "returnByValue": True},
+                    session_id=cached[3],
+                )
+            except BaseException:
+                await self._close_snapshot_session()
+                raise
+        after_state = json.loads(after["result"]["value"])
+        expected = {
             key: state[key]
             for key in (
                 "url",
@@ -884,7 +932,8 @@ class BrowserObserver:
                 "scroll_y",
                 "position_revision",
             )
-        }:
+        }
+        if after_state != expected:
             raise web.HTTPConflict(text="Page changed; refresh observation.")
         raw = base64.b64decode(shot["data"])
         with Image.open(io.BytesIO(raw)) as picture:
@@ -904,7 +953,8 @@ class BrowserObserver:
             image=shot["data"], mime_type="image/jpeg", capture_timestamp=captured_at
         )
         if (
-            self.server.browser_session is not browser
+            self._closed
+            or self.server.browser_session is not browser
             or browser.agent_focus_target_id != state["tab_id"]
         ):
             raise web.HTTPConflict(text="Browser target changed; refresh observation.")
@@ -1074,6 +1124,7 @@ class BrowserObserver:
         acknowledgements = asyncio.Queue(maxsize=8)
         ack_task = asyncio.create_task(self.acknowledge(acknowledgements))
         overflow = False
+        last_frame = time.monotonic()
 
         def frame_received(event, session_id):
             """Queue acknowledgements and retain only a current-target image.
@@ -1110,6 +1161,7 @@ class BrowserObserver:
                         self._refresh_stream
                         or active is None
                         or active[0] is not browser
+                        or active[1].session_id != cdp.session_id
                         or active[2] != target
                     )
                     navigated = metadata is not None and (
@@ -1185,15 +1237,18 @@ class BrowserObserver:
                             (frame_metadata.get("offsetTop"), 0),
                         )
                     )
-                    if cdp is not None and self.control_mode == "human":
+                    if cdp is not None and (
+                        self.control_mode == "human"
+                        or (event is None and time.monotonic() - last_frame >= 1)
+                    ):
                         # Static pages can stop emitting screencast frames after
                         # asynchronous input effects. Reuse validated snapshots
                         # while a human is interacting, at the same bounded rate.
                         frame = await asyncio.wait_for(
                             self.capture_snapshot(browser, cdp, state), 3
                         )
-                        if self.control_mode == "human":
-                            self.publish("frame", frame)
+                        self.publish("frame", frame)
+                        last_frame = time.monotonic()
                     elif event is not None and cdp is not None and coordinates_match:
                         raw = base64.b64decode(event["data"], validate=True)
                         with Image.open(io.BytesIO(raw)) as picture:
@@ -1216,6 +1271,7 @@ class BrowserObserver:
                                     "capture_timestamp": event["metadata"]["timestamp"],
                                 },
                             )
+                            last_frame = time.monotonic()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -1269,6 +1325,8 @@ class BrowserObserver:
         """Release the bridge and remove only this process's discovery record."""
         self._closed = True
         self.control_mode = "paused"
+        self.human = None
+        self.control_epoch += 1
         with contextlib.suppress(Exception):
             await self.release_keys()
         if self._human_expiry is not None:
@@ -1281,6 +1339,8 @@ class BrowserObserver:
                 await self._producer
         if self.runner is not None:
             await self.runner.cleanup()
+        async with self._snapshot_lock:
+            await self._close_snapshot_session()
         if self.discovery.exists():
             record = json.loads(self.discovery.read_text(encoding="utf-8"))
             if record.get("generation") == self.generation:

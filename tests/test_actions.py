@@ -1,15 +1,18 @@
 """Exercise action terminal states, privacy and bounded recovery delivery."""
 
 import asyncio
+import base64
 import importlib.util
+import io
 import json
 import sys
 import types
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import aiohttp
 import pytest
+from PIL import Image
 
 from observation_queue import ACTION_LIMIT, ObservationQueue
 from observer import BrowserObserver
@@ -883,12 +886,13 @@ async def test_keyboard_order_privacy_and_cleanup(observed_server):
 
 
 @pytest.mark.parametrize("fault", ["error", "timeout"])
+@pytest.mark.parametrize("held_input", ["key", "mouse"])
 @pytest.mark.parametrize(
     "operation",
     ["release", "disconnect", "expiry", "stop_execution", "stop", "close", "disable"],
 )
 async def test_key_release_fault_cannot_preserve_control_or_block_termination(
-    observed_server, monkeypatch, fault, operation
+    observed_server, monkeypatch, fault, held_input, operation
 ):
     """Revoke credentials and keep termination reachable after an uncertain keyUp.
 
@@ -896,6 +900,7 @@ async def test_key_release_fault_cannot_preserve_control_or_block_termination(
         observed_server: Private observer and stub browser execution wrapper.
         monkeypatch: Accelerate only the controller lease deadline.
         fault: Whether the original target raises or never acknowledges keyUp.
+        held_input: Unconfirmed key or mouse press on the lost target.
         operation: Handback, revocation or terminal operation under test.
     """
     server, observer, upstream = observed_server
@@ -937,7 +942,9 @@ async def test_key_release_fault_cannot_preserve_control_or_block_termination(
     cdp_bad = SimpleNamespace(
         session_id="detached",
         cdp_client=SimpleNamespace(
-            send=SimpleNamespace(Input=SimpleNamespace(dispatchKeyEvent=bad))
+            send=SimpleNamespace(
+                Input=SimpleNamespace(dispatchKeyEvent=bad, dispatchMouseEvent=bad)
+            )
         ),
     )
     cdp_good = SimpleNamespace(
@@ -960,9 +967,15 @@ async def test_key_release_fault_cannot_preserve_control_or_block_termination(
             ) as response:
                 epoch = (await response.json())["control_epoch"]
             observer._held_keys = {
-                "ShiftLeft": (cdp_bad, {"code": "ShiftLeft", "key": "Shift"}),
                 "ControlLeft": (cdp_good, {"code": "ControlLeft", "key": "Control"}),
             }
+            if held_input == "key":
+                observer._held_keys["ShiftLeft"] = (
+                    cdp_bad,
+                    {"code": "ShiftLeft", "key": "Shift"},
+                )
+            else:
+                observer._held_mouse = (cdp_bad, 100, 80)
             if operation == "expiry":
                 monkeypatch.setattr(asyncio, "sleep", lease_sleep)
                 async with http.post(
@@ -1004,7 +1017,11 @@ async def test_key_release_fault_cannot_preserve_control_or_block_termination(
                 assert response.status == 409
             if operation not in {"close", "disable"}:
                 assert observer.control_mode == "paused"
-                assert "ShiftLeft" in observer._held_keys
+                assert (
+                    ("ShiftLeft" in observer._held_keys)
+                    if held_input == "key"
+                    else observer._held_mouse is not None
+                )
                 if operation == "release":
                     async with http.post(
                         url, json={**identity, "operation": "acquire"}
@@ -1018,7 +1035,116 @@ async def test_key_release_fault_cannot_preserve_control_or_block_termination(
                     assert response.status == 200
             server._close_all_sessions.assert_awaited_once()
             assert server.browser_session is None and not observer._held_keys
+            assert observer._held_mouse is None
             assert good.await_count == 1
+    finally:
+        await observer.close()
+
+
+async def test_mouse_cleanup_cannot_complete_an_uncertain_click(observed_server):
+    """Release the original mouse outside the document without a new press.
+
+    Args:
+        observed_server: Observer with controlled CDP input dispatch.
+    """
+    _, observer, _ = observed_server
+    dispatch = AsyncMock()
+    cdp = SimpleNamespace(
+        session_id="original",
+        cdp_client=SimpleNamespace(
+            send=SimpleNamespace(Input=SimpleNamespace(dispatchMouseEvent=dispatch))
+        ),
+    )
+    observer._held_mouse = (cdp, 100, 80)
+    await observer.release_keys()
+    dispatch.assert_awaited_once_with(
+        params={
+            "type": "mouseReleased",
+            "x": -1,
+            "y": -1,
+            "button": "left",
+            "clickCount": 1,
+        },
+        session_id="original",
+    )
+    assert observer._held_mouse is None
+
+
+async def test_partial_click_cleans_original_press_without_replay(observed_server):
+    """An uncertain mouse release consumes its input and cancels the held press.
+
+    Args:
+        observed_server: Real manual HTTP handler with controlled CDP responses.
+    """
+    server, observer, _ = observed_server
+    observer.owner = "trusted-chat"
+    dispatch = AsyncMock(
+        side_effect=[None, RuntimeError("Lost release response"), None]
+    )
+    cdp = SimpleNamespace(
+        session_id="original",
+        cdp_client=SimpleNamespace(
+            send=SimpleNamespace(Input=SimpleNamespace(dispatchMouseEvent=dispatch))
+        ),
+    )
+    state = {
+        **observer.read_state.return_value[2],
+        "document_id": "doc",
+        "viewport_width": 1280,
+        "viewport_height": 720,
+        "scroll_x": 0,
+        "scroll_y": 0,
+    }
+    observer.read_state.return_value = (server.browser_session, cdp, state)
+    identity = {
+        "generation": observer.generation,
+        "browser_session_id": "browser",
+        "owner": "trusted-chat",
+        "client_id": "human",
+    }
+    await observer.start()
+    port = json.loads(observer.discovery.read_text())["port"]
+    try:
+        async with aiohttp.ClientSession(
+            headers={"Authorization": "Bearer secret"}
+        ) as http:
+            url = f"http://127.0.0.1:{port}/manual"
+            async with http.post(
+                url, json={**identity, "operation": "acquire"}
+            ) as response:
+                epoch = (await response.json())["control_epoch"]
+            command = {
+                **identity,
+                "operation": "click",
+                "control_epoch": epoch,
+                "input_id": 1,
+                "x": 100,
+                "y": 80,
+                "target": {
+                    key: state[key]
+                    for key in (
+                        "tab_id",
+                        "document_id",
+                        "viewport_width",
+                        "viewport_height",
+                        "scroll_x",
+                        "scroll_y",
+                    )
+                },
+            }
+            async with http.post(url, json=command) as response:
+                assert (await response.json())["status"] == "uncertain"
+            assert observer.control_mode == "paused"
+            assert observer.human["last_input"] == 1
+            assert observer.applied_input_id == 0
+            assert observer._held_mouse is None
+            assert [
+                call.kwargs["params"]["type"] for call in dispatch.await_args_list
+            ] == ["mousePressed", "mouseReleased", "mouseReleased"]
+            assert dispatch.await_args.kwargs["params"]["x"] == -1
+            async with http.post(url, json=command) as response:
+                assert response.status == 409
+            assert dispatch.await_count == 3
     finally:
         await observer.close()
 
@@ -1067,3 +1193,102 @@ async def test_captured_input_ack_cannot_cross_control_epoch(observed_server):
     frame = observer.publish("frame", {"control_epoch": 6, "applied_input_id": 9})
     assert frame["control_epoch"] == 6
     assert frame["applied_input_id"] == 9
+
+
+async def test_capture_session_preserves_viewport_and_is_bounded(
+    observed_server, monkeypatch
+):
+    """Capture without stale Agent metrics and release old capture targets.
+
+    Args:
+        observed_server: Observer and owned browser with controlled native captures.
+        monkeypatch: Replace only the private capture transport constructor.
+    """
+    server, observer, _ = observed_server
+    live = dict(
+        url="local",
+        title="Page",
+        document_id="doc",
+        viewport_width=1280,
+        viewport_height=720,
+        scroll_x=0,
+        scroll_y=0,
+        position_revision=0,
+    )
+    image = io.BytesIO()
+    Image.new("RGB", (10, 10)).save(image, format="JPEG")
+
+    async def screenshot(**kwargs):
+        """Model Chrome's transient resize after an auxiliary metrics detach.
+
+        Args:
+            **kwargs: Native screenshot parameters and owned session.
+
+        Returns:
+            Bounded image, after the native view emitted resize events.
+        """
+        if kwargs["session_id"] == "agent":
+            live["position_revision"] += 2
+        assert "clip" not in kwargs["params"]
+        return {"data": base64.b64encode(image.getvalue()).decode()}
+
+    async def evaluate(**kwargs):
+        """Read the metadata after the simulated native capture.
+
+        Args:
+            **kwargs: Trusted runtime metadata expression.
+
+        Returns:
+            Current page state.
+        """
+        return {"result": {"value": json.dumps(live)}}
+
+    shot = AsyncMock(side_effect=screenshot)
+    attach = AsyncMock(
+        side_effect=[{"sessionId": "capture-1"}, {"sessionId": "capture-2"}]
+    )
+    clients = [
+        SimpleNamespace(
+            start=AsyncMock(),
+            stop=AsyncMock(),
+            send=SimpleNamespace(
+                Target=SimpleNamespace(attachToTarget=attach),
+                Page=SimpleNamespace(captureScreenshot=shot),
+                Runtime=SimpleNamespace(evaluate=AsyncMock(side_effect=evaluate)),
+            ),
+        )
+        for _ in range(4)
+    ]
+    factory = Mock(side_effect=clients)
+    monkeypatch.setitem(sys.modules, "cdp_use", SimpleNamespace(CDPClient=factory))
+    cdp = SimpleNamespace(session_id="agent")
+    browser = server.browser_session
+    browser.cdp_url = "ws://isolated-browser"
+    browser.agent_focus_target_id = "tab"
+    clients[0].start.side_effect = RuntimeError("Capture transport unavailable")
+    with pytest.raises(RuntimeError):
+        await observer.capture_snapshot(browser, cdp, {**live, "tab_id": "tab"})
+    clients[0].stop.assert_awaited_once()
+    clients[1].send.Target.attachToTarget = AsyncMock(
+        side_effect=asyncio.CancelledError
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await observer.capture_snapshot(browser, cdp, {**live, "tab_id": "tab"})
+    clients[1].stop.assert_awaited_once()
+    frame = await observer.capture_snapshot(browser, cdp, {**live, "tab_id": "tab"})
+    assert frame["position_revision"] == 0
+    live.update(viewport_width=960, viewport_height=600, position_revision=3)
+    frame = await observer.capture_snapshot(browser, cdp, {**live, "tab_id": "tab"})
+    assert frame["viewport_width"] == 960
+    assert "clip" not in shot.await_args.kwargs["params"]
+    assert attach.await_count == 1 and clients[2].stop.await_count == 0
+    browser.agent_focus_target_id = "next"
+    await observer.capture_snapshot(browser, cdp, {**live, "tab_id": "next"})
+    assert attach.await_count == 2
+    clients[2].stop.assert_awaited_once()
+    await observer.close()
+    clients[3].stop.assert_awaited_once()
+    with pytest.raises(aiohttp.web.HTTPConflict):
+        await observer.capture_snapshot(browser, cdp, {**live, "tab_id": "next"})
+    assert observer._snapshot_session is None
+    assert factory.call_count == 4
