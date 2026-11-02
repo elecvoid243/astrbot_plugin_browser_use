@@ -118,6 +118,21 @@ def main() -> None:
                     RuntimeError: Transport, protocol, or tool execution fails.
                 """
                 nonlocal request_id
+                if method == "tools/call":
+                    # This probe is the trusted host of its disposable runtime.
+                    bridge = json.loads(bridge_file.read_text(encoding="utf-8"))
+                    params = {
+                        **params,
+                        "arguments": {
+                            **params.get("arguments", {}),
+                            "_astrbot_action": {
+                                "owner": "offline-smoke",
+                                "generation": bridge["generation"],
+                                "lease": "offline-smoke",
+                                "control_epoch": 0,
+                            },
+                        },
+                    }
                 request_id += 1
                 process.stdin.write(
                     json.dumps(
