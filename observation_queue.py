@@ -7,11 +7,12 @@ ACTION_LIMIT = 128
 
 
 class ObservationQueue:
-    """Keep one image and a bounded ordered action backlog per viewer."""
+    """Keep one image, one state and a bounded ordered action backlog per viewer."""
 
     def __init__(self):
         self.actions = deque()
         self.latest = None
+        self.state = None
         self.ready = asyncio.Event()
         self.closed = False
 
@@ -28,8 +29,12 @@ class ObservationQueue:
                 self.actions.clear()
                 event = {**event, "type": "state", "action_reset": True}
             self.actions.append(event)
-        else:
+        elif event.get("type") == "frame":
             self.latest = event
+        else:
+            # Control/heartbeat metadata must not erase the only new pixels of
+            # a static page. Retain one state and one frame in sequence order.
+            self.state = event
         self.ready.set()
 
     async def get(self):
@@ -39,13 +44,23 @@ class ObservationQueue:
             An observation, or None after buffered events have been drained.
         """
         while True:
-            if self.actions or self.latest is not None:
-                if self.actions and (
-                    self.latest is None
-                    or self.actions[0]["sequence"] < self.latest["sequence"]
-                ):
+            candidates = [
+                event
+                for event in (
+                    self.actions[0] if self.actions else None,
+                    self.latest,
+                    self.state,
+                )
+                if event is not None
+            ]
+            if candidates:
+                event = min(candidates, key=lambda item: item["sequence"])
+                if self.actions and event is self.actions[0]:
                     return self.actions.popleft()
-                event, self.latest = self.latest, None
+                if event is self.latest:
+                    self.latest = None
+                else:
+                    self.state = None
                 return event
             if self.closed:
                 return None

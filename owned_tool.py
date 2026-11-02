@@ -53,6 +53,10 @@ class OwnedBrowserTool(MCPTool):
         plugin = self.plugin
         if not plugin._enabled or self.activation_token != plugin._bridge_token:
             raise RuntimeError("Browser Use is disabled.")
+        if plugin._manual_blocked:
+            raise RuntimeError(
+                "Browser is under human control or paused; explicitly hand control back first."
+            )
         if plugin._stopped or getattr(event, "get_extra", lambda *args: False)(
             "agent_stop_requested", False
         ):
@@ -69,7 +73,12 @@ class OwnedBrowserTool(MCPTool):
         async with plugin._operation_lock:
             if not plugin._enabled or self.activation_token != plugin._bridge_token:
                 raise RuntimeError("Browser Use is disabled.")
-            if plugin._owner != owner or plugin._lease != lease or plugin._stopped:
+            if (
+                plugin._owner != owner
+                or plugin._lease != lease
+                or plugin._stopped
+                or plugin._manual_blocked
+            ):
                 raise RuntimeError("Browser ownership expired; retry from this chat.")
             action_id = uuid4().hex
             activation_token = plugin._bridge_token
@@ -89,6 +98,9 @@ class OwnedBrowserTool(MCPTool):
                                 "invocation_id": current_tool_invocation.get(),
                                 "timeout": max(0.01, context.tool_call_timeout * 0.95),
                                 "lease": lease,
+                                "control_epoch": plugin._control_epoch,
+                                "owner": owner,
+                                "generation": bridge["generation"] if bridge else None,
                             },
                         },
                     )

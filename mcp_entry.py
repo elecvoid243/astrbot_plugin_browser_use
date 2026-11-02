@@ -46,6 +46,25 @@ class LocalBrowserServer(BrowserUseServer):
             raise RuntimeError(
                 "Browser execution stopped; close the session before restarting."
             )
+        if observer.control_mode != "agent":
+            raise RuntimeError(
+                "Browser is under human control or paused; explicitly hand control back first."
+            )
+        if metadata.get("control_epoch", 0) != observer.control_epoch:
+            raise RuntimeError("Browser control epoch expired; observe the page again.")
+        owner = metadata.get("owner")
+        if (
+            not isinstance(owner, str)
+            or not owner
+            or metadata.get("generation") != observer.generation
+        ):
+            raise RuntimeError(
+                "Trusted browser owner and runtime generation are required."
+            )
+        if observer.owner is None:
+            observer.owner = owner
+        elif observer.owner != owner:
+            raise RuntimeError("Browser is owned by another chat.")
         observer.execution_state = "active"
         action_id = metadata.get("action_id") or uuid4().hex
         if action_id in observer.cancelled_actions:
@@ -119,6 +138,9 @@ class LocalBrowserServer(BrowserUseServer):
                 # A host reconciliation can have finalized this action already.
                 if observer.current_action is action:
                     observer.current_action = None
+                    if status == "succeeded" and self.browser_session is None:
+                        observer.owner = None
+                        observer.revoked_leases.append(metadata.get("lease"))
                     if action["browser_session_id"] is None and self.browser_session:
                         action["browser_session_id"] = self.browser_session.id
                     if status != "succeeded":

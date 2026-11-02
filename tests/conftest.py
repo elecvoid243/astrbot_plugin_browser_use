@@ -35,6 +35,7 @@ def plugin_class(monkeypatch, tmp_path):
         "astrbot",
         "astrbot.api",
         "astrbot.api.star",
+        "astrbot.api.event",
         "astrbot.core",
         "astrbot.core.agent",
         "astrbot.core.agent.mcp_client",
@@ -49,6 +50,10 @@ def plugin_class(monkeypatch, tmp_path):
     api.Star = Star
     api.StarTools = types.SimpleNamespace(
         get_data_dir=lambda name: tmp_path / "data" / name
+    )
+    sys.modules["astrbot.api.event"].AstrMessageEvent = object
+    sys.modules["astrbot.api.event"].filter = types.SimpleNamespace(
+        on_waiting_llm_request=lambda: lambda handler: handler
     )
 
     class MCPTool:
@@ -71,7 +76,7 @@ def plugin_class(monkeypatch, tmp_path):
     sys.modules[
         "astrbot.core.utils.active_event_registry"
     ].active_event_registry = types.SimpleNamespace(
-        request_agent_stop_all=lambda owner: 0
+        request_agent_stop_all=lambda owner: 0, has_active_agent=lambda owner: False
     )
     web = types.ModuleType("astrbot.api.web")
     web.request = types.SimpleNamespace()

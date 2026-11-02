@@ -11,6 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 import aiohttp
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.web import error_response, json_response, request
 from astrbot.core.utils.active_event_registry import active_event_registry
@@ -47,6 +48,27 @@ class BrowserUsePlugin(Star):
         self._disable_revision = 0
         self._control_lock = asyncio.Lock()
         self._closed_state = None
+        self._manual_blocked = False
+        self._control_epoch = 0
+
+    @filter.on_waiting_llm_request()
+    async def guard_human_control(self, event: AstrMessageEvent):
+        """Reject new model turns until the human explicitly hands control back.
+
+        Args:
+            event: Trusted foreground or background chat event.
+        """
+        if (
+            self._enabled
+            and self._manual_blocked
+            and event.unified_msg_origin == self._owner
+        ):
+            event.stop_event()
+            await event.send(
+                event.plain_result(
+                    "Browser is under human control or paused. Hand control back in the Agent browser before starting a new task."
+                )
+            )
 
     async def initialize(self) -> None:
         """Connect the private MCP runtime and expose its browser tools.
@@ -106,6 +128,14 @@ class BrowserUsePlugin(Star):
                     # Retained tools are guarded even when disable overtakes startup.
                     return
                 self._enabled = True
+                self._manual_blocked = False
+                self._control_epoch = 0
+                self.context.register_web_api(
+                    "/browser-use/manual",
+                    self.browser_manual,
+                    ["POST"],
+                    "Authenticated host browser control channel.",
+                )
                 for control in ("stop", "close"):
                     self.context.register_web_api(
                         f"/browser-use/{control}",
@@ -268,7 +298,7 @@ class BrowserUsePlugin(Star):
         lease = self._lease
         token = self._bridge_token
         path = request.path.rsplit("/", 1)[-1]
-        if path not in {"snapshot", "stream", "stop", "close"}:
+        if path not in {"snapshot", "stream", "stop", "close", "manual"}:
             path = "status"
         try:
             if self._bridge_file is None:
@@ -276,7 +306,7 @@ class BrowserUsePlugin(Star):
             bridge = json.loads(self._bridge_file.read_text(encoding="utf-8"))
             generation = request.query.get("generation")
             browser_session_id = request.query.get("browser_session_id")
-            if path in {"snapshot", "stream", "stop", "close"} and (
+            if path in {"snapshot", "stream", "stop", "close", "manual"} and (
                 not generation or not browser_session_id
             ):
                 return error_response("Browser identity is required.", status_code=400)
@@ -319,6 +349,61 @@ class BrowserUsePlugin(Star):
                 return await self.browser_control(
                     path, bridge, state, owner, lease, token
                 )
+            if path == "manual":
+                command = getattr(request, "browser_control", None)
+                if command is None:
+                    return error_response(
+                        "Use the authenticated host control channel.", status_code=403
+                    )
+                if command["operation"] == "inspect":
+                    return json_response({"status": "ok", "data": state})
+                async with self._control_lock:
+                    if (
+                        not self._enabled
+                        or self._bridge_token != token
+                        or self._owner != owner
+                    ):
+                        return error_response(
+                            "Browser ownership expired.", status_code=409
+                        )
+                    if command["operation"] == "acquire":
+                        if (
+                            active_event_registry.has_active_agent(owner)
+                            or self._operation_lock.locked()
+                            or self._stopped
+                        ):
+                            return error_response(
+                                "An Agent is running or stopped; idle takeover is required.",
+                                status_code=409,
+                            )
+                        self._manual_blocked = True
+                        self._lease += 1
+                    async with aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=10)
+                    ) as client:
+                        async with client.post(
+                            f"http://127.0.0.1:{int(bridge['port'])}/manual",
+                            headers={"Authorization": f"Bearer {token}"},
+                            json={
+                                **command,
+                                "owner": owner,
+                                "generation": generation,
+                                "browser_session_id": browser_session_id,
+                            },
+                        ) as response:
+                            if response.status != 200:
+                                return error_response(
+                                    await response.text(), status_code=response.status
+                                )
+                            result = await response.json()
+                    self._control_epoch = result["control_epoch"]
+                    if command["operation"] == "release":
+                        self._manual_blocked = False
+                        self._lease += 1
+                    return json_response(
+                        {"status": "ok", "data": result},
+                        headers={"Cache-Control": "no-store"},
+                    )
             if path == "stream":
                 try:
                     action_cursor = int(request.query.get("action_cursor", "0"))
@@ -343,6 +428,20 @@ class BrowserUsePlugin(Star):
                 status_code=503,
                 data={"reason": "runtime_unavailable"},
             )
+
+    async def browser_manual(self):
+        """Enter the observer only through the host's trusted control context.
+
+        Returns:
+            A manual-control acknowledgement for the authenticated socket.
+        """
+        if getattr(request, "browser_control", None) is None:
+            return error_response(
+                "Authenticated control channel required.", status_code=403
+            )
+        return await self.browser_observation()
+
+    browser_manual.__astrbot_chat_guard__ = "browser-owned-chat-control-v1"
 
     # The host admits only the actual ownership-aware observer, including old
     # installations where an unguarded handler may still occupy the same route.
@@ -398,7 +497,9 @@ class BrowserUsePlugin(Star):
                         status_code=503,
                         data={"reason": "disabled"},
                     )
+                self._control_epoch = result.get("control_epoch", self._control_epoch)
                 if operation == "close":
+                    self._manual_blocked = False
                     self._closed_state = (self._webchat_owner, result)
                     self._owner = None
                     self._webchat_owner = None
@@ -435,7 +536,7 @@ class BrowserUsePlugin(Star):
             queue = ObservationQueue()
 
             async def receive():
-                """Read independently of downstream backpressure into one slot."""
+                """Read independently of downstream backpressure into bounded frame and state slots."""
                 try:
                     async with aiohttp.ClientSession(
                         timeout=aiohttp.ClientTimeout(

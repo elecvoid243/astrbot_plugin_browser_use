@@ -127,7 +127,13 @@ async def test_control_waits_for_execution_and_revokes_old_lease(observed_server
                 )
             upstream.side_effect = None
             await server._execute_tool(
-                "browser_type", {"_astrbot_action": {"lease": 3}}
+                "browser_type",
+                {
+                    "_astrbot_action": {
+                        "lease": 3,
+                        "control_epoch": observer.control_epoch,
+                    }
+                },
             )
     finally:
         release.set()
@@ -178,6 +184,24 @@ def observed_server(monkeypatch, tmp_path):
             },
         )
     )
+    execute = server._execute_tool
+
+    async def owned_execution(name, arguments):
+        """Supply trusted host metadata for action-lifecycle fixtures.
+
+        Args:
+            name: Browser tool under test.
+            arguments: Explicit test inputs and optional overridden identity.
+
+        Returns:
+            The runtime admission result.
+        """
+        metadata = arguments.setdefault("_astrbot_action", {})
+        metadata.setdefault("owner", "trusted-chat")
+        metadata.setdefault("generation", observer.generation)
+        return await execute(name, arguments)
+
+    server._execute_tool = owned_execution
     return server, observer, upstream
 
 
@@ -395,3 +419,165 @@ async def test_target_requires_actual_metadata_and_matching_document(
     await server._mark_target(page, details, "click")
     assert bool(observer.highlight) == expected
     assert "secret" not in json.dumps(observer.highlight)
+
+
+async def test_manual_admission_ordering_target_and_explicit_handback(observed_server):
+    """Reject stale identities and duplicate input without changing the browser.
+
+    Args:
+        observed_server: Isolated runtime admission wrapper and bridge.
+    """
+    server, observer, upstream = observed_server
+    dispatch = AsyncMock()
+    server.browser_session.get_browser_state_summary = AsyncMock()
+    observer.owner = "trusted-chat"
+    state = {
+        "generation": observer.generation,
+        "browser_session_id": "browser",
+        "tab_id": "tab",
+        "document_id": "doc",
+        "viewport_width": 1280,
+        "viewport_height": 720,
+        "scroll_x": 0,
+        "scroll_y": 0,
+    }
+    observer.read_state.return_value = (
+        server.browser_session,
+        SimpleNamespace(
+            session_id="cdp",
+            cdp_client=SimpleNamespace(
+                send=SimpleNamespace(Input=SimpleNamespace(dispatchMouseEvent=dispatch))
+            ),
+        ),
+        state,
+    )
+    await observer.start()
+    bridge = json.loads(observer.discovery.read_text())
+    identity = {
+        "generation": observer.generation,
+        "browser_session_id": "browser",
+        "owner": "trusted-chat",
+        "client_id": "socket-1",
+    }
+    try:
+        async with aiohttp.ClientSession(
+            headers={"Authorization": "Bearer secret"}
+        ) as http:
+            url = f"http://127.0.0.1:{bridge['port']}/manual"
+            async with http.post(
+                url, json={**identity, "generation": "old", "operation": "acquire"}
+            ) as response:
+                assert response.status == 409
+            observer.current_action = {"action_id": "pending"}
+            async with http.post(
+                url, json={**identity, "operation": "acquire"}
+            ) as response:
+                assert response.status == 409
+            observer.current_action = None
+            async with http.post(
+                url, json={**identity, "operation": "acquire"}
+            ) as response:
+                assert response.status == 200
+                epoch = (await response.json())["control_epoch"]
+            async with http.post(
+                url, json={**identity, "client_id": "other", "operation": "acquire"}
+            ) as response:
+                assert response.status == 409
+            with pytest.raises(RuntimeError, match="human control"):
+                await server._execute_tool("browser_type", {})
+            click = {
+                **identity,
+                "operation": "click",
+                "control_epoch": epoch,
+                "input_id": 1,
+                "x": 100,
+                "y": 80,
+                "target": {
+                    key: state[key]
+                    for key in (
+                        "tab_id",
+                        "document_id",
+                        "viewport_width",
+                        "viewport_height",
+                        "scroll_x",
+                        "scroll_y",
+                    )
+                },
+            }
+            for patch in (
+                {"client_id": "forged"},
+                {"control_epoch": epoch - 1},
+                {"target": {**click["target"], "document_id": "old"}},
+                {"input_id": 2},
+            ):
+                async with http.post(url, json={**click, **patch}) as response:
+                    assert response.status == 409
+            for _ in range(2):
+                async with http.post(url, json=click) as response:
+                    assert response.status == 200
+                    assert (await response.json())["status"] == "applied"
+            assert dispatch.await_count == 2  # One press/release, even after retry.
+            async with http.post(
+                url,
+                json={**identity, "operation": "disconnect", "control_epoch": epoch},
+            ) as response:
+                assert response.status == 200
+            assert observer.control_mode == "paused"
+            with pytest.raises(RuntimeError, match="paused"):
+                await server._execute_tool("browser_type", {})
+            async with http.post(
+                url, json={**identity, "operation": "acquire"}
+            ) as response:
+                epoch = (await response.json())["control_epoch"]
+            async with http.post(
+                url, json={**identity, "operation": "release", "control_epoch": epoch}
+            ) as response:
+                assert response.status == 200
+                renewed = (await response.json())["control_epoch"]
+            assert observer.control_mode == "agent"
+            server.browser_session.get_browser_state_summary.assert_awaited_once_with(
+                cached=False
+            )
+            with pytest.raises(RuntimeError, match="epoch expired"):
+                await server._execute_tool(
+                    "browser_type", {"_astrbot_action": {"control_epoch": epoch}}
+                )
+            await server._execute_tool(
+                "browser_type", {"_astrbot_action": {"control_epoch": renewed}}
+            )
+            assert server.browser_session.id == "browser"
+            with pytest.raises(RuntimeError, match="another chat"):
+                await server._execute_tool(
+                    "browser_type",
+                    {
+                        "_astrbot_action": {
+                            "owner": "forged-chat",
+                            "control_epoch": renewed,
+                        }
+                    },
+                )
+            with pytest.raises(RuntimeError, match="generation"):
+                await server._execute_tool(
+                    "browser_type",
+                    {
+                        "_astrbot_action": {
+                            "generation": "old",
+                            "control_epoch": renewed,
+                        }
+                    },
+                )
+    finally:
+        await observer.close()
+
+
+async def test_control_metadata_preserves_static_page_frame():
+    """A click acknowledgement or heartbeat cannot erase its only changed frame."""
+    queue = ObservationQueue()
+    queue.put_nowait({"type": "frame", "sequence": 10, "image": "clicked-page"})
+    queue.put_nowait({"type": "state", "sequence": 11, "control_mode": "human"})
+    assert (await queue.get())["image"] == "clicked-page"
+    assert (await queue.get())["control_mode"] == "human"
+    queue.put_nowait({"type": "state", "sequence": 12, "control_mode": "human"})
+    queue.put_nowait({"type": "frame", "sequence": 13, "image": "newer-page"})
+    assert (await queue.get())["sequence"] == 12
+    assert (await queue.get())["sequence"] == 13

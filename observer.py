@@ -58,6 +58,12 @@ class BrowserObserver:
         self.action_done = asyncio.Event()
         self.action_done.set()
         self._control_lock = asyncio.Lock()
+        self.control_mode = "agent"
+        self.owner = None
+        self.control_epoch = 0
+        self.human = None
+        self._human_expiry = None
+        self._held_mouse = None
 
     async def start(self) -> None:
         """Bind an ephemeral loopback port and publish its discovery record.
@@ -72,6 +78,7 @@ class BrowserObserver:
         app.router.add_get("/stream", self.stream)
         app.router.add_post("/action/cancel", self.cancel_action)
         app.router.add_post("/control", self.control)
+        app.router.add_post("/manual", self.manual)
         self.runner = web.AppRunner(app, access_log=None)
         await self.runner.setup()
         site = web.TCPSite(self.runner, "127.0.0.1", 0)
@@ -101,6 +108,9 @@ class BrowserObserver:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "available": browser is not None,
             "execution_state": self.execution_state,
+            "control_mode": self.control_mode,
+            "control_epoch": self.control_epoch,
+            "manual_control_version": 1,
             "url": "",
             "title": "",
             "width": 0,
@@ -145,6 +155,208 @@ class BrowserObserver:
             raise web.HTTPConflict(text="Browser target changed; refresh observation.")
         state.update(self.action_state(browser.id))
         return browser, cdp, state
+
+    async def manual(self, request):
+        """Serialize typed human commands with Agent admission in this runtime.
+
+        Args:
+            request: Host-authenticated command with trusted owner and connection.
+
+        Returns:
+            Ordered acknowledgement and fresh page metadata, without credentials.
+
+        Raises:
+            HTTPUnauthorized: The private bridge credential is invalid.
+            HTTPConflict: Ownership, epoch, ordering or displayed target expired.
+            HTTPBadRequest: The operation or click coordinates are invalid.
+        """
+        if not hmac.compare_digest(
+            request.headers.get("Authorization", ""), f"Bearer {self.token}"
+        ):
+            raise web.HTTPUnauthorized()
+        body = await request.json()
+        operation = body.get("operation")
+        async with self._control_lock:
+            browser = self.server.browser_session
+            if (
+                self._closed
+                or body.get("generation") != self.generation
+                or browser is None
+                or body.get("browser_session_id") != browser.id
+                or body.get("owner") != self.owner
+            ):
+                raise web.HTTPConflict(text="Browser identity expired.")
+            if operation == "acquire":
+                if self.human is not None or self.control_mode == "acquiring":
+                    raise web.HTTPConflict(
+                        text="Browser already has a human controller."
+                    )
+                if self.execution_state != "active" or self.current_action is not None:
+                    raise web.HTTPConflict(
+                        text="An active or stopped Agent cannot be taken over yet."
+                    )
+                self.control_mode = "acquiring"
+                try:
+                    _, cdp, state = await asyncio.wait_for(self.read_state(), 3)
+                    if cdp is None:
+                        raise web.HTTPConflict(
+                            text="No current browser target is available."
+                        )
+                    self.control_epoch += 1
+                    self.human = {
+                        "owner": body["owner"],
+                        "client_id": body["client_id"],
+                        "last_input": 0,
+                        "last_ack": None,
+                    }
+                    self.control_mode = "human"
+                except BaseException:
+                    self.control_mode = "paused"
+                    raise
+            else:
+                if (
+                    self.human is None
+                    or self.human["owner"] != body.get("owner")
+                    or self.human["client_id"] != body.get("client_id")
+                    or self.control_epoch != body.get("control_epoch")
+                ):
+                    raise web.HTTPConflict(text="Human control expired.")
+                if self.control_mode != "human" and operation not in {
+                    "release",
+                    "disconnect",
+                }:
+                    raise web.HTTPConflict(text="Browser input is paused.")
+                if operation in {"release", "disconnect"}:
+                    self.control_mode = "paused"
+                    if self._held_mouse is not None:
+                        cdp, x, y = self._held_mouse
+                        await asyncio.wait_for(
+                            cdp.cdp_client.send.Input.dispatchMouseEvent(
+                                params={
+                                    "type": "mouseReleased",
+                                    "x": x,
+                                    "y": y,
+                                    "button": "left",
+                                    "clickCount": 1,
+                                },
+                                session_id=cdp.session_id,
+                            ),
+                            3,
+                        )
+                        self._held_mouse = None
+                    self.human = None
+                    self.control_epoch += 1
+                    self.control_mode = "paused"
+                    # Existing element indices cannot survive human page changes.
+                    browser._cached_browser_state_summary = None
+                    browser._cached_selector_map = {}
+                    browser._cached_selector_indices = {}
+                    if operation == "release":
+                        await asyncio.wait_for(
+                            browser.get_browser_state_summary(cached=False), 5
+                        )
+                        self.control_mode = "agent"
+                elif operation == "click":
+                    number = body.get("input_id")
+                    if type(number) is not int or number < 1:
+                        raise web.HTTPBadRequest(text="Invalid input number.")
+                    if number == self.human["last_input"]:
+                        return web.json_response(self.human["last_ack"])
+                    if number != self.human["last_input"] + 1:
+                        raise web.HTTPConflict(text="Input sequence expired.")
+                    _, cdp, state = await asyncio.wait_for(self.read_state(), 3)
+                    target = body.get("target", {})
+                    if cdp is None or any(
+                        target.get(key) != state.get(key)
+                        for key in (
+                            "tab_id",
+                            "document_id",
+                            "viewport_width",
+                            "viewport_height",
+                            "scroll_x",
+                            "scroll_y",
+                        )
+                    ):
+                        raise web.HTTPConflict(
+                            text="Displayed target expired; refresh observation."
+                        )
+                    x, y = body.get("x"), body.get("y")
+                    if (
+                        any(
+                            type(value) not in (int, float) or not math.isfinite(value)
+                            for value in (x, y)
+                        )
+                        or not 0 <= x < state["viewport_width"]
+                        or not 0 <= y < state["viewport_height"]
+                    ):
+                        raise web.HTTPBadRequest(text="Invalid click coordinates.")
+                    # Consume before dispatch: an uncertain CDP response must never
+                    # cause a retry to click twice.
+                    self.human["last_input"] = number
+                    self.human["last_ack"] = {
+                        "operation": "click",
+                        "input_id": number,
+                        "status": "uncertain",
+                        "control_epoch": self.control_epoch,
+                    }
+                    try:
+                        for kind in ("mousePressed", "mouseReleased"):
+                            self._held_mouse = (cdp, x, y)
+                            await asyncio.wait_for(
+                                cdp.cdp_client.send.Input.dispatchMouseEvent(
+                                    params={
+                                        "type": kind,
+                                        "x": x,
+                                        "y": y,
+                                        "button": "left",
+                                        "clickCount": 1,
+                                    },
+                                    session_id=cdp.session_id,
+                                ),
+                                3,
+                            )
+                        self._held_mouse = None
+                    except Exception:
+                        return web.json_response(self.human["last_ack"])
+                    self.human["last_ack"] = {
+                        "operation": "click",
+                        "input_id": number,
+                        "status": "applied",
+                        "control_epoch": self.control_epoch,
+                    }
+                elif operation != "heartbeat":
+                    raise web.HTTPBadRequest(text="Unsupported manual operation.")
+            if self._human_expiry is not None:
+                self._human_expiry.cancel()
+                self._human_expiry = None
+            if self.human is not None:
+                epoch = self.control_epoch
+
+                async def expire():
+                    """Revoke a silent connection without restarting any Agent."""
+                    await asyncio.sleep(30)
+                    async with self._control_lock:
+                        if self.control_epoch == epoch:
+                            self.human = None
+                            self.control_epoch += 1
+                            self.control_mode = "paused"
+                            await self.action_changed()
+
+                self._human_expiry = asyncio.create_task(expire())
+            _, _, state = await asyncio.wait_for(self.read_state(), 3)
+            state.update(
+                control_mode=self.control_mode, control_epoch=self.control_epoch
+            )
+            self.publish("state", state)
+            return web.json_response(
+                {
+                    "operation": operation,
+                    "status": "applied",
+                    "input_id": body.get("input_id"),
+                    "control_epoch": self.control_epoch,
+                    "state": state,
+                }
+            )
 
     def action_state(self, session_id):
         """Read a bounded action snapshot scoped to one browser lifetime.
@@ -224,6 +436,9 @@ class BrowserObserver:
         action_id = body.get("action_id")
         if body.get("stop_execution"):
             self.execution_state = "stopped"
+            self.human = None
+            self.control_epoch += 1
+            self.control_mode = "paused"
             self.revoked_leases.append(body.get("lease"))
         self.cancelled_actions.append(action_id)
         if self.current_action and self.current_action["action_id"] == action_id:
@@ -279,6 +494,9 @@ class BrowserObserver:
             ):
                 raise web.HTTPConflict(text="Browser session expired.")
             self.execution_state = "stopped"
+            self.human = None
+            self.control_epoch += 1
+            self.control_mode = "paused"
             self.revoked_leases.append(body.get("lease"))
             self.highlight = None
             if self.current_action:
@@ -302,9 +520,11 @@ class BrowserObserver:
                 }
             if operation in {"close", "disable"}:
                 await self.server._close_all_sessions()
+                self.owner = None
                 self.execution_state = (
                     "disabled" if operation == "disable" else "closed"
                 )
+                self.control_mode = "agent" if operation == "close" else "paused"
                 state.update(available=False, url="", title="", width=0, height=0)
             state.update(self.action_state(browser.id if browser else None))
             state["execution_state"] = self.execution_state
@@ -326,6 +546,9 @@ class BrowserObserver:
         event = {
             **state,
             "execution_state": self.execution_state,
+            "control_mode": self.control_mode,
+            "control_epoch": self.control_epoch,
+            "manual_control_version": 1,
             **self.action_state(state.get("browser_session_id")),
             "type": kind,
             "sequence": self.sequence,
@@ -333,6 +556,68 @@ class BrowserObserver:
         for queue in self.subscribers:
             queue.put_nowait(event)
         return event
+
+    async def capture_snapshot(self, browser, cdp, state):
+        """Capture pixels with the same document and viewport consistency checks.
+
+        Args:
+            browser: Actual owned BrowserSession, never a client-selected browser.
+            cdp: Runtime-resolved current target's CDP session.
+            state: Metadata sampled immediately before capturing the viewport.
+
+        Returns:
+            Bounded JPEG pixels tagged with their validated document identity.
+
+        Raises:
+            HTTPConflict: Navigation, target or viewport changed during capture.
+            HTTPRequestEntityTooLarge: The encoded image exceeds the bridge budget.
+        """
+        state = dict(state)
+        captured_at = time.time()
+        shot = await cdp.cdp_client.send.Page.captureScreenshot(
+            params={
+                "format": "jpeg",
+                "quality": 65,
+                "captureBeyondViewport": False,
+            },
+            session_id=cdp.session_id,
+        )
+        after = await cdp.cdp_client.send.Runtime.evaluate(
+            params={
+                "expression": "JSON.stringify({url:location.href,title:document.title,document_id:String(performance.timeOrigin),viewport_width:innerWidth,viewport_height:innerHeight,scroll_x:scrollX,scroll_y:scrollY})",
+                "returnByValue": True,
+            },
+            session_id=cdp.session_id,
+        )
+        if json.loads(after["result"]["value"]) != {
+            key: state[key]
+            for key in (
+                "url",
+                "title",
+                "document_id",
+                "viewport_width",
+                "viewport_height",
+                "scroll_x",
+                "scroll_y",
+            )
+        }:
+            raise web.HTTPConflict(text="Page changed; refresh observation.")
+        raw = base64.b64decode(shot["data"])
+        if len(raw) > MAX_IMAGE_BYTES:
+            raise web.HTTPRequestEntityTooLarge(
+                max_size=MAX_IMAGE_BYTES, actual_size=len(raw)
+            )
+        with Image.open(io.BytesIO(raw)) as picture:
+            state["width"], state["height"] = picture.size
+        state.update(
+            image=shot["data"], mime_type="image/jpeg", capture_timestamp=captured_at
+        )
+        if (
+            self.server.browser_session is not browser
+            or browser.agent_focus_target_id != state["tab_id"]
+        ):
+            raise web.HTTPConflict(text="Browser target changed; refresh observation.")
+        return state
 
     async def observe(self, request: web.Request) -> web.Response:
         """Read metadata or capture the focused target without rebuilding the DOM.
@@ -363,45 +648,9 @@ class BrowserObserver:
             return web.json_response(state, headers={"Cache-Control": "no-store"})
         target = state["tab_id"]
         if request.path == "/snapshot":
-            shot = await cdp.cdp_client.send.Page.captureScreenshot(
-                params={
-                    "format": "jpeg",
-                    "quality": 65,
-                    "captureBeyondViewport": False,
-                },
-                session_id=cdp.session_id,
-            )
-            after = await cdp.cdp_client.send.Runtime.evaluate(
-                params={
-                    "expression": "JSON.stringify({url:location.href,title:document.title,document_id:String(performance.timeOrigin),viewport_width:innerWidth,viewport_height:innerHeight,scroll_x:scrollX,scroll_y:scrollY})",
-                    "returnByValue": True,
-                },
-                session_id=cdp.session_id,
-            )
-            if json.loads(after["result"]["value"]) != {
-                key: state[key]
-                for key in (
-                    "url",
-                    "title",
-                    "document_id",
-                    "viewport_width",
-                    "viewport_height",
-                    "scroll_x",
-                    "scroll_y",
-                )
-            }:
-                raise web.HTTPConflict(text="Page changed; refresh observation.")
-            raw = base64.b64decode(shot["data"])
-            if len(raw) > MAX_IMAGE_BYTES:
-                raise web.HTTPRequestEntityTooLarge(
-                    max_size=MAX_IMAGE_BYTES, actual_size=len(raw)
-                )
-            with Image.open(io.BytesIO(raw)) as picture:
-                state["width"], state["height"] = picture.size
+            state = await self.capture_snapshot(browser, cdp, state)
             self.sequence += 1
-            state.update(
-                sequence=self.sequence, image=shot["data"], mime_type="image/jpeg"
-            )
+            state["sequence"] = self.sequence
         # A concurrent tab switch must never label an old image as the new page.
         if (
             self.server.browser_session is not browser
@@ -412,7 +661,7 @@ class BrowserObserver:
         return web.json_response(state, headers={"Cache-Control": "no-store"})
 
     async def stream(self, request: web.Request) -> web.StreamResponse:
-        """Subscribe to the existing browser using a single pending event slot.
+        """Subscribe to the existing browser using bounded frame and state slots.
 
         Args:
             request: Credential-protected request with generation/session identity.
@@ -637,7 +886,16 @@ class BrowserObserver:
                             (frame_metadata.get("offsetTop"), 0),
                         )
                     )
-                    if event is not None and cdp is not None and coordinates_match:
+                    if cdp is not None and self.control_mode == "human":
+                        # Static pages can stop emitting screencast frames after
+                        # asynchronous input effects. Reuse validated snapshots
+                        # while a human is interacting, at the same bounded rate.
+                        frame = await asyncio.wait_for(
+                            self.capture_snapshot(browser, cdp, state), 3
+                        )
+                        if self.control_mode == "human":
+                            self.publish("frame", frame)
+                    elif event is not None and cdp is not None and coordinates_match:
                         raw = base64.b64decode(event["data"], validate=True)
                         with Image.open(io.BytesIO(raw)) as picture:
                             width, height = picture.size
@@ -707,6 +965,8 @@ class BrowserObserver:
     async def close(self) -> None:
         """Release the bridge and remove only this process's discovery record."""
         self._closed = True
+        if self._human_expiry is not None:
+            self._human_expiry.cancel()
         for queue in self.subscribers:
             queue.put_nowait(None)
         if self._producer is not None:
