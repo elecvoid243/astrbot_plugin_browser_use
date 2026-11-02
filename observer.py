@@ -1,4 +1,4 @@
-"""Read-only observation of the MCP server's actual Chromium session."""
+"""Observe and authorize typed control of the actual Chromium session."""
 
 from __future__ import annotations
 
@@ -63,6 +63,7 @@ class BrowserObserver:
         self.control_epoch = 0
         self.human = None
         self._human_expiry = None
+        self._held_keys = {}
         self._held_mouse = None
         self.pending_browser_events = []
 
@@ -112,6 +113,7 @@ class BrowserObserver:
             "control_mode": self.control_mode,
             "control_epoch": self.control_epoch,
             "manual_control_version": 1,
+            "keyboard_input_version": 1,
             "url": "",
             "title": "",
             "width": 0,
@@ -156,6 +158,29 @@ class BrowserObserver:
             raise web.HTTPConflict(text="Browser target changed; refresh observation.")
         state.update(self.action_state(browser.id))
         return browser, cdp, state
+
+    async def release_keys(self):
+        """Release keys on their original CDP session before changing admission.
+
+        Raises:
+            Exception: Chromium cannot confirm release; admission stays paused.
+        """
+        for code, (cdp, params) in list(self._held_keys.items()):
+            await asyncio.wait_for(
+                cdp.cdp_client.send.Input.dispatchKeyEvent(
+                    params={
+                        **params,
+                        "type": "keyUp",
+                        "modifiers": 0,
+                        "text": "",
+                        "unmodifiedText": "",
+                        "autoRepeat": False,
+                    },
+                    session_id=cdp.session_id,
+                ),
+                3,
+            )
+            self._held_keys.pop(code, None)
 
     async def manual(self, request):
         """Serialize typed human commands with Agent admission in this runtime.
@@ -251,6 +276,7 @@ class BrowserObserver:
                     raise web.HTTPConflict(text="Browser input is paused.")
                 if operation in {"release", "disconnect"}:
                     self.control_mode = "paused"
+                    await self.release_keys()
                     if self._held_mouse is not None:
                         cdp, x, y = self._held_mouse
                         await asyncio.wait_for(
@@ -288,7 +314,7 @@ class BrowserObserver:
                                 text="Fresh browser observation failed."
                             )
                         self.control_mode = "agent"
-                elif operation == "click":
+                elif operation in {"click", "key", "text", "reset_keys"}:
                     number = body.get("input_id")
                     if type(number) is not int or number < 1:
                         raise web.HTTPBadRequest(text="Invalid input number.")
@@ -298,60 +324,175 @@ class BrowserObserver:
                         raise web.HTTPConflict(text="Input sequence expired.")
                     _, cdp, state = await asyncio.wait_for(self.read_state(), 3)
                     target = body.get("target", {})
-                    if cdp is None or any(
-                        target.get(key) != state.get(key)
-                        for key in (
-                            "tab_id",
-                            "document_id",
-                            "viewport_width",
-                            "viewport_height",
-                            "scroll_x",
-                            "scroll_y",
+                    if operation != "reset_keys" and (
+                        cdp is None
+                        or any(
+                            target.get(key) != state.get(key)
+                            for key in (
+                                "tab_id",
+                                "document_id",
+                                "viewport_width",
+                                "viewport_height",
+                                "scroll_x",
+                                "scroll_y",
+                            )
                         )
                     ):
+                        await self.release_keys()
                         raise web.HTTPConflict(
                             text="Displayed target expired; refresh observation."
                         )
-                    x, y = body.get("x"), body.get("y")
-                    if (
-                        any(
-                            type(value) not in (int, float) or not math.isfinite(value)
-                            for value in (x, y)
-                        )
-                        or not 0 <= x < state["viewport_width"]
-                        or not 0 <= y < state["viewport_height"]
-                    ):
-                        raise web.HTTPBadRequest(text="Invalid click coordinates.")
+                    params = None
+                    if operation == "click":
+                        x, y = body.get("x"), body.get("y")
+                        if (
+                            any(
+                                type(v) not in (int, float) or not math.isfinite(v)
+                                for v in (x, y)
+                            )
+                            or not 0 <= x < state["viewport_width"]
+                            or not 0 <= y < state["viewport_height"]
+                        ):
+                            raise web.HTTPBadRequest(text="Invalid click coordinates.")
+                    elif operation == "text":
+                        text = body.get("text")
+                        if (
+                            not isinstance(text, str)
+                            or not text
+                            or len(text) > 2048
+                            or any(0xD800 <= ord(char) <= 0xDFFF for char in text)
+                            or len(text.encode("utf-8")) > 4096
+                            or "\x00" in text
+                            or body.get("source")
+                            not in {"typing", "composition", "paste"}
+                        ):
+                            raise web.HTTPBadRequest(text="Invalid text input.")
+                    elif operation == "key":
+                        code, key = body.get("code"), body.get("key")
+                        special = {
+                            "Backspace": 8,
+                            "Tab": 9,
+                            "Enter": 13,
+                            "Escape": 27,
+                            "Space": 32,
+                            "PageUp": 33,
+                            "PageDown": 34,
+                            "End": 35,
+                            "Home": 36,
+                            "ArrowLeft": 37,
+                            "ArrowUp": 38,
+                            "ArrowRight": 39,
+                            "ArrowDown": 40,
+                            "Delete": 46,
+                            "ShiftLeft": 16,
+                            "ShiftRight": 16,
+                            "ControlLeft": 17,
+                            "ControlRight": 17,
+                            "AltLeft": 18,
+                            "AltRight": 18,
+                            "MetaLeft": 91,
+                            "MetaRight": 92,
+                        }
+                        virtual = special.get(code)
+                        if (
+                            isinstance(code, str)
+                            and len(code) == 4
+                            and code.startswith("Key")
+                            and "A" <= code[-1] <= "Z"
+                        ):
+                            virtual = ord(code[-1])
+                        modifiers = body.get("modifiers", 0)
+                        if (
+                            virtual is None
+                            or not isinstance(key, str)
+                            or len(key) > 32
+                            or body.get("phase") not in {"down", "up"}
+                            or type(modifiers) is not int
+                            or not 0 <= modifiers <= 15
+                            or type(body.get("repeat", False)) is not bool
+                        ):
+                            raise web.HTTPBadRequest(text="Invalid key input.")
+                        params = {
+                            "type": "rawKeyDown"
+                            if body["phase"] == "down"
+                            else "keyUp",
+                            "key": key,
+                            "code": code,
+                            "windowsVirtualKeyCode": virtual,
+                            "modifiers": modifiers,
+                            "autoRepeat": body.get("repeat", False),
+                        }
+                        if code == "Enter" and body["phase"] == "down":
+                            params.update(
+                                type="keyDown", text="\r", unmodifiedText="\r"
+                            )
                     # Consume before dispatch: an uncertain CDP response must never
                     # cause a retry to click twice.
                     self.human["last_input"] = number
                     self.human["last_ack"] = {
-                        "operation": "click",
+                        "operation": operation,
                         "input_id": number,
                         "status": "uncertain",
                         "control_epoch": self.control_epoch,
                     }
                     try:
-                        for kind in ("mousePressed", "mouseReleased"):
-                            self._held_mouse = (cdp, x, y)
+                        if operation == "click":
+                            for kind in ("mousePressed", "mouseReleased"):
+                                self._held_mouse = (cdp, x, y)
+                                await asyncio.wait_for(
+                                    cdp.cdp_client.send.Input.dispatchMouseEvent(
+                                        params={
+                                            "type": kind,
+                                            "x": x,
+                                            "y": y,
+                                            "button": "left",
+                                            "clickCount": 1,
+                                        },
+                                        session_id=cdp.session_id,
+                                    ),
+                                    3,
+                                )
+                            self._held_mouse = None
+                        elif operation == "reset_keys":
+                            await self.release_keys()
+                        elif operation == "text":
                             await asyncio.wait_for(
-                                cdp.cdp_client.send.Input.dispatchMouseEvent(
-                                    params={
-                                        "type": kind,
-                                        "x": x,
-                                        "y": y,
-                                        "button": "left",
-                                        "clickCount": 1,
-                                    },
-                                    session_id=cdp.session_id,
+                                cdp.cdp_client.send.Input.insertText(
+                                    params={"text": text}, session_id=cdp.session_id
                                 ),
                                 3,
                             )
-                        self._held_mouse = None
+                        else:
+                            # Track before sending so uncertain dispatches are cleaned up too.
+                            if body["phase"] == "down":
+                                self._held_keys[code] = (cdp, params)
+                            await asyncio.wait_for(
+                                cdp.cdp_client.send.Input.dispatchKeyEvent(
+                                    params=params, session_id=cdp.session_id
+                                ),
+                                3,
+                            )
+                            if body["phase"] == "up":
+                                self._held_keys.pop(code, None)
                     except Exception:
+                        self.control_mode = "paused"
+                        with contextlib.suppress(Exception):
+                            await self.release_keys()
                         return web.json_response(self.human["last_ack"])
+                    if operation in {"text", "key"}:
+                        # The timeline contains categories only, including for passwords.
+                        self.recent_actions.append(
+                            {
+                                "action_id": uuid4().hex,
+                                "kind": "type",
+                                "status": "succeeded",
+                                "input_category": body.get("source", "keyboard"),
+                                "browser_session_id": browser.id,
+                            }
+                        )
+                        await self.action_changed()
                     self.human["last_ack"] = {
-                        "operation": "click",
+                        "operation": operation,
                         "input_id": number,
                         "status": "applied",
                         "control_epoch": self.control_epoch,
@@ -369,6 +510,8 @@ class BrowserObserver:
                     await asyncio.sleep(30)
                     async with self._control_lock:
                         if self.control_epoch == epoch:
+                            self.control_mode = "paused"
+                            await self.release_keys()
                             self.human = None
                             self.control_epoch += 1
                             self.control_mode = "paused"
@@ -469,6 +612,8 @@ class BrowserObserver:
         action_id = body.get("action_id")
         if body.get("stop_execution"):
             self.execution_state = "stopped"
+            self.control_mode = "paused"
+            await self.release_keys()
             self.human = None
             self.control_epoch += 1
             self.control_mode = "paused"
@@ -527,6 +672,8 @@ class BrowserObserver:
             ):
                 raise web.HTTPConflict(text="Browser session expired.")
             self.execution_state = "stopped"
+            self.control_mode = "paused"
+            await self.release_keys()
             self.human = None
             self.control_epoch += 1
             self.control_mode = "paused"
@@ -582,6 +729,7 @@ class BrowserObserver:
             "control_mode": self.control_mode,
             "control_epoch": self.control_epoch,
             "manual_control_version": 1,
+            "keyboard_input_version": 1,
             **self.action_state(state.get("browser_session_id")),
             "type": kind,
             "sequence": self.sequence,
@@ -678,6 +826,7 @@ class BrowserObserver:
                     "control_mode": self.control_mode,
                     "control_epoch": self.control_epoch,
                     "manual_control_version": 1,
+                    "keyboard_input_version": 1,
                 },
                 headers={"Cache-Control": "no-store"},
             )
@@ -1003,6 +1152,9 @@ class BrowserObserver:
     async def close(self) -> None:
         """Release the bridge and remove only this process's discovery record."""
         self._closed = True
+        self.control_mode = "paused"
+        with contextlib.suppress(Exception):
+            await self.release_keys()
         if self._human_expiry is not None:
             self._human_expiry.cancel()
         for queue in self.subscribers:

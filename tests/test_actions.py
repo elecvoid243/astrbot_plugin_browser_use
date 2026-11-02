@@ -715,3 +715,130 @@ async def test_control_metadata_preserves_static_page_frame():
     queue.put_nowait({"type": "frame", "sequence": 13, "image": "newer-page"})
     assert (await queue.get())["sequence"] == 12
     assert (await queue.get())["sequence"] == 13
+
+
+async def test_keyboard_order_privacy_and_cleanup(observed_server):
+    """Validate text bounds, ordering and held-key cleanup inside the runtime.
+
+    Args:
+        observed_server: Private observer with controlled Chromium transport.
+    """
+    server, observer, _ = observed_server
+    observer.owner = "trusted-chat"
+    state = {
+        **observer.read_state.return_value[2],
+        "tab_id": "tab",
+        "document_id": "doc",
+        "viewport_width": 1280,
+        "viewport_height": 720,
+        "scroll_x": 0,
+        "scroll_y": 0,
+    }
+    transport = SimpleNamespace(dispatchKeyEvent=AsyncMock(), insertText=AsyncMock())
+    cdp = SimpleNamespace(
+        session_id="cdp",
+        cdp_client=SimpleNamespace(send=SimpleNamespace(Input=transport)),
+    )
+    observer.read_state.return_value = (server.browser_session, cdp, state)
+    await observer.start()
+    bridge = json.loads(observer.discovery.read_text())
+    identity = {
+        "generation": observer.generation,
+        "browser_session_id": "browser",
+        "owner": "trusted-chat",
+        "client_id": "human",
+    }
+    target = {
+        key: state[key]
+        for key in (
+            "tab_id",
+            "document_id",
+            "viewport_width",
+            "viewport_height",
+            "scroll_x",
+            "scroll_y",
+        )
+    }
+    try:
+        async with aiohttp.ClientSession(
+            headers={"Authorization": "Bearer secret"}
+        ) as http:
+            url = f"http://127.0.0.1:{bridge['port']}/manual"
+            async with http.post(
+                url, json={**identity, "operation": "acquire"}
+            ) as response:
+                epoch = (await response.json())["control_epoch"]
+            base = {**identity, "control_epoch": epoch, "target": target}
+            text = {
+                **base,
+                "input_id": 1,
+                "operation": "text",
+                "source": "paste",
+                "text": "secret中文🙂",
+            }
+            for _ in range(2):
+                async with http.post(url, json=text) as response:
+                    assert response.status == 200
+            transport.insertText.assert_awaited_once()
+            assert "secret" not in json.dumps(list(observer.recent_actions))
+            async with http.post(
+                url, json={**text, "input_id": 2, "text": "中" * 1500}
+            ) as response:
+                assert response.status == 400
+            key = {
+                **base,
+                "operation": "key",
+                "input_id": 2,
+                "phase": "down",
+                "key": "Shift",
+                "code": "ShiftLeft",
+                "modifiers": 8,
+            }
+            async with http.post(url, json=key) as response:
+                assert response.status == 200
+            assert "ShiftLeft" in observer._held_keys
+            async with http.post(
+                url,
+                json={
+                    **text,
+                    "input_id": 3,
+                    "target": {**target, "document_id": "old"},
+                },
+            ) as response:
+                assert response.status == 409
+            assert not observer._held_keys
+            assert (
+                transport.dispatchKeyEvent.await_args.kwargs["params"]["type"]
+                == "keyUp"
+            )
+            async with http.post(url, json={**key, "input_id": 3}) as response:
+                assert response.status == 200
+            async with http.post(
+                url, json={**base, "operation": "reset_keys", "input_id": 4}
+            ) as response:
+                assert response.status == 200
+            assert not observer._held_keys
+            async with http.post(url, json={**key, "input_id": 5}) as response:
+                assert response.status == 200
+            async with http.post(
+                url, json={**base, "operation": "disconnect"}
+            ) as response:
+                assert response.status == 200
+            assert not observer._held_keys and observer.control_mode == "paused"
+            async with http.post(
+                url, json={**identity, "operation": "acquire"}
+            ) as response:
+                epoch = (await response.json())["control_epoch"]
+            async with http.post(
+                url, json={**key, "input_id": 1, "control_epoch": epoch}
+            ) as response:
+                assert response.status == 200
+            async with http.post(
+                url.replace("/manual", "/control"),
+                json={**identity, "operation": "stop"},
+            ) as response:
+                assert response.status == 200
+            assert not observer._held_keys and observer.execution_state == "stopped"
+
+    finally:
+        await observer.close()
