@@ -50,6 +50,7 @@ class BrowserUsePlugin(Star):
         self._closed_state = None
         self._manual_blocked = False
         self._control_epoch = 0
+        self._agent_pause = None
 
     @filter.on_waiting_llm_request()
     async def guard_human_control(self, event: AstrMessageEvent):
@@ -183,6 +184,9 @@ class BrowserUsePlugin(Star):
         self._enabled = False
         self._stopped = True
         self._lease += 1
+        if self._owner is not None and self._agent_pause is not None:
+            active_event_registry.request_agent_stop_all(self._owner)
+            self._agent_pause.resume()
         async with self._lock:
             if self._shutdown_event is None:
                 return
@@ -314,7 +318,7 @@ class BrowserUsePlugin(Star):
                 return error_response("Browser generation expired.", status_code=409)
             private_path = (
                 "identity"
-                if path in {"stop", "close"}
+                if path in {"stop", "close", "manual"}
                 else "snapshot"
                 if path == "snapshot"
                 else "status"
@@ -367,19 +371,25 @@ class BrowserUsePlugin(Star):
                             "Browser ownership expired.", status_code=409
                         )
                     if command["operation"] == "acquire":
-                        if (
-                            active_event_registry.has_active_agent(owner)
-                            or self._operation_lock.locked()
-                            or self._stopped
-                        ):
+                        if self._stopped or state.get("control_mode") in {
+                            "human",
+                            "acquiring",
+                        }:
                             return error_response(
-                                "An Agent is running or stopped; idle takeover is required.",
+                                "Browser is stopped or already controlled by another client.",
                                 status_code=409,
                             )
                         self._manual_blocked = True
                         self._lease += 1
+                        self._agent_pause = (
+                            active_event_registry.get_agent_manual_pause(owner)
+                        )
+                        self._agent_pause.pause()
+                        self.logger.info(
+                            "Browser control acquisition requested; Agent admission paused."
+                        )
                     async with aiohttp.ClientSession(
-                        timeout=aiohttp.ClientTimeout(total=10)
+                        timeout=aiohttp.ClientTimeout(total=20)
                     ) as client:
                         async with client.post(
                             f"http://127.0.0.1:{int(bridge['port'])}/manual",
@@ -397,9 +407,12 @@ class BrowserUsePlugin(Star):
                                 )
                             result = await response.json()
                     self._control_epoch = result["control_epoch"]
+                    observation = result.pop("agent_observation", "")
                     if command["operation"] == "release":
                         self._manual_blocked = False
                         self._lease += 1
+                        if self._agent_pause is not None:
+                            self._agent_pause.resume(observation)
                     return json_response(
                         {"status": "ok", "data": result},
                         headers={"Cache-Control": "no-store"},
@@ -507,6 +520,8 @@ class BrowserUsePlugin(Star):
                 # The browser request has drained. Cancelling a runner before this
                 # point could cancel the MCP SDK handler instead of its child.
                 active_event_registry.request_agent_stop_all(owner)
+                if operation == "close" and self._agent_pause is not None:
+                    self._agent_pause.resume()
             return json_response(
                 {"status": "ok", "data": result}, headers={"Cache-Control": "no-store"}
             )

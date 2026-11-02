@@ -128,7 +128,8 @@ class OwnedBrowserTool(MCPTool):
                                     "lease": lease,
                                     "stop_execution": isinstance(
                                         exc, asyncio.CancelledError
-                                    ),
+                                    )
+                                    and not plugin._manual_blocked,
                                     "status": "cancelled"
                                     if isinstance(exc, asyncio.CancelledError)
                                     else "timed_out"

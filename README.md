@@ -167,16 +167,21 @@ python -m pytest tests/test_observation.py -q
 禁用先撤销准入，再结束动作、会话、观测、回环桥和自有 MCP。清理失败保留所有权以便重试；不接管或关闭其他实例服务。重新启用建立新代次。残留 HTTP 路由禁用后返回 `503 disabled`，旧会话控制返回 `409`。
 
 
-## 空闲浏览器人工接管 / Idle manual control
+## Agent 浏览器人工接管 / Agent browser manual control
 
-配套 AstrBot 宿主与 Dashboard 支持 H01 控制协议时，在 Agent 完成后点击
+配套 AstrBot 宿主与 Dashboard 支持 H01/H02 控制协议时，在 Agent 运行中或完成后点击
 **接管浏览器**。后端确认前保持只读；确认后可单击原有 Chromium 页面，再点击
-**交还控制权**。浏览器、标签页和登录态保留。运行中的 Agent 暂不能接管。
+**交还控制权**。浏览器、标签页和登录态保留。运行中的本地 Agent 在接管时暂停，
+在途动作及页面事件确认静止前不开放人工输入。交还后废弃旧计划，依据最新页面重新决策；
+人工等待不占工具超时，不持续调用模型。取消或结束的轮次不会被交还重新启动。
 断连、隐藏面板或观测失效后保持暂停，需要主动重新接管并交还；停止、关闭、禁用仍
 保留各自语义。旧客户端继续观测，旧插件在新界面保持只读并显示升级提示。
 
 With the matching host and Dashboard, **Take control** admits one authenticated
-human after the Agent finishes. Click the existing Chromium page, then **Hand back**
+human while the local Agent runs or after it finishes. In-flight browser events
+must settle before human input is acknowledged. The current turn pauses outside
+tool timeouts, discards stale plans and replans from a fresh page observation only
+after explicit handback. Cancelled or completed turns remain terminal. Click the existing Chromium page, then **Hand back**
 to refresh page/element knowledge and restore Agent admission. Browser and login
 state survive. Disconnect pauses input and never starts an Agent automatically.
 
@@ -195,4 +200,4 @@ Control metadata cannot overwrite the only pending changed frame of a static pag
 The exact protocol is documented in the matching AstrBot source at
 `docs/en/dev/browser-manual-control.md` and `docs/zh/dev/browser-manual-control.md`.
 Keyboard/composition/paste, scrolling/double-click and full lifecycle recovery are
-subsequent H02–H05 work; final offline-package acceptance belongs to H06.
+subsequent H03–H05 work; final offline-package acceptance belongs to H06.

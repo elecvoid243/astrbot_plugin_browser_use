@@ -430,6 +430,7 @@ async def test_manual_admission_ordering_target_and_explicit_handback(observed_s
     server, observer, upstream = observed_server
     dispatch = AsyncMock()
     server.browser_session.get_browser_state_summary = AsyncMock()
+    server._get_browser_state = AsyncMock(return_value=("fresh page", None))
     observer.owner = "trusted-chat"
     state = {
         "generation": observer.generation,
@@ -468,7 +469,10 @@ async def test_manual_admission_ordering_target_and_explicit_handback(observed_s
                 url, json={**identity, "generation": "old", "operation": "acquire"}
             ) as response:
                 assert response.status == 409
-            observer.current_action = {"action_id": "pending"}
+            observer.current_action = {
+                "action_id": "pending",
+                "browser_session_id": "browser",
+            }
             async with http.post(
                 url, json={**identity, "operation": "acquire"}
             ) as response:
@@ -566,6 +570,136 @@ async def test_manual_admission_ordering_target_and_explicit_handback(observed_s
                         }
                     },
                 )
+    finally:
+        await observer.close()
+
+
+@pytest.mark.parametrize("settles", [False, True])
+async def test_running_takeover_waits_for_actual_dispatched_browser_events(
+    observed_server, settles
+):
+    """Keep input disabled until both tool cleanup and page event handlers settle.
+
+    Args:
+        observed_server: Private execution wrapper and loopback bridge.
+        settles: Whether the detached browser event finishes within the deadline.
+    """
+    server, observer, upstream = observed_server
+    entered, cleaning, release, event_done = (asyncio.Event() for _ in range(4))
+
+    async def execute(*args):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaning.set()
+            await release.wait()
+
+    upstream.side_effect = execute
+    observer.owner = "trusted-chat"
+    observer.pending_browser_events.append(
+        SimpleNamespace(event_completed_signal=event_done)
+    )
+    # Admission normally registers an event after starting the tool.
+    pending = observer.pending_browser_events.pop()
+    running = asyncio.create_task(server._execute_tool("browser_type", {}))
+    await entered.wait()
+    observer.pending_browser_events.append(pending)
+    state = observer.read_state.return_value[2]
+    observer.read_state.return_value = (server.browser_session, object(), state)
+    await observer.start()
+    bridge = json.loads(observer.discovery.read_text())
+    identity = {
+        "generation": observer.generation,
+        "browser_session_id": "browser",
+        "owner": "trusted-chat",
+        "client_id": "human",
+    }
+    try:
+        async with aiohttp.ClientSession(
+            headers={"Authorization": "Bearer secret"}
+        ) as http:
+            acquiring = asyncio.create_task(
+                http.post(
+                    f"http://127.0.0.1:{bridge['port']}/manual",
+                    json={**identity, "operation": "acquire"},
+                )
+            )
+            await asyncio.wait_for(cleaning.wait(), 2)
+            assert observer.control_mode == "acquiring" and observer.human is None
+            with pytest.raises(RuntimeError, match="human control"):
+                await server._execute_tool("browser_type", {})
+            release.set()
+            with pytest.raises(RuntimeError, match="cancelled"):
+                await running
+            await asyncio.sleep(0.05)
+            assert not acquiring.done()
+            if settles:
+                event_done.set()
+            response = await asyncio.wait_for(acquiring, 7)
+            assert response.status == (200 if settles else 504)
+            assert observer.control_mode == ("human" if settles else "paused")
+            assert (observer.human is not None) == settles
+            response.release()
+            assert observer.execution_state == "active"
+            assert observer.recent_actions[-1]["status"] == "cancelled"
+    finally:
+        event_done.set()
+        release.set()
+        await observer.close()
+
+
+async def test_failed_handback_keeps_agent_admission_closed(observed_server):
+    """A failed fresh observation must not renew Agent admission.
+
+    Args:
+        observed_server: Private execution wrapper and authenticated bridge.
+    """
+    server, observer, _ = observed_server
+    observer.owner = "trusted-chat"
+    state = observer.read_state.return_value[2]
+    observer.read_state.return_value = (server.browser_session, object(), state)
+    server.browser_session.get_browser_state_summary = AsyncMock()
+    server._get_browser_state = AsyncMock(
+        return_value=("Error: Target unavailable", None)
+    )
+    await observer.start()
+    bridge = json.loads(observer.discovery.read_text())
+    identity = {
+        "generation": observer.generation,
+        "browser_session_id": "browser",
+        "owner": "trusted-chat",
+        "client_id": "human",
+    }
+    try:
+        async with aiohttp.ClientSession(
+            headers={"Authorization": "Bearer secret"}
+        ) as http:
+            url = f"http://127.0.0.1:{bridge['port']}/manual"
+            async with http.post(
+                url, json={**identity, "operation": "acquire"}
+            ) as response:
+                epoch = (await response.json())["control_epoch"]
+            async with http.post(
+                url, json={**identity, "operation": "release", "control_epoch": epoch}
+            ) as response:
+                assert response.status == 409
+            assert observer.control_mode == "paused" and observer.human is None
+            with pytest.raises(RuntimeError, match="paused"):
+                await server._execute_tool("browser_type", {})
+            server._get_browser_state.return_value = ("fresh current page", None)
+            async with http.post(
+                url, json={**identity, "operation": "acquire"}
+            ) as response:
+                epoch = (await response.json())["control_epoch"]
+            async with http.post(
+                url, json={**identity, "operation": "release", "control_epoch": epoch}
+            ) as response:
+                assert response.status == 200
+                assert (await response.json())[
+                    "agent_observation"
+                ] == "fresh current page"
+            assert observer.control_mode == "agent"
     finally:
         await observer.close()
 

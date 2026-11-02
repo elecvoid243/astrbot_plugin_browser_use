@@ -64,6 +64,7 @@ class BrowserObserver:
         self.human = None
         self._human_expiry = None
         self._held_mouse = None
+        self.pending_browser_events = []
 
     async def start(self) -> None:
         """Bind an ephemeral loopback port and publish its discovery record.
@@ -176,6 +177,7 @@ class BrowserObserver:
             raise web.HTTPUnauthorized()
         body = await request.json()
         operation = body.get("operation")
+        agent_observation = ""
         async with self._control_lock:
             browser = self.server.browser_session
             if (
@@ -191,18 +193,37 @@ class BrowserObserver:
                     raise web.HTTPConflict(
                         text="Browser already has a human controller."
                     )
-                if self.execution_state != "active" or self.current_action is not None:
-                    raise web.HTTPConflict(
-                        text="An active or stopped Agent cannot be taken over yet."
-                    )
+                if self.execution_state != "active":
+                    raise web.HTTPConflict(text="A stopped Agent cannot be taken over.")
                 self.control_mode = "acquiring"
+                self.control_epoch += 1
                 try:
+                    await self.action_changed()
+                    if self.current_action is not None:
+                        self.cancelled_actions.append(self.current_action["action_id"])
+                        if self.action_task is not None:
+                            self.action_task.cancel()
+                        await asyncio.wait_for(self.action_done.wait(), 5)
+                        if self.current_action is not None:
+                            raise web.HTTPConflict(text="Agent action has not settled.")
+                    # Bubus dispatch survives cancellation of the waiting tool.
+                    # Never acknowledge human admission before its handlers settle.
+                    if self.pending_browser_events:
+                        await asyncio.wait_for(
+                            asyncio.gather(
+                                *(
+                                    event.event_completed_signal.wait()
+                                    for event in self.pending_browser_events
+                                )
+                            ),
+                            5,
+                        )
+                        self.pending_browser_events.clear()
                     _, cdp, state = await asyncio.wait_for(self.read_state(), 3)
                     if cdp is None:
                         raise web.HTTPConflict(
                             text="No current browser target is available."
                         )
-                    self.control_epoch += 1
                     self.human = {
                         "owner": body["owner"],
                         "client_id": body["client_id"],
@@ -212,6 +233,8 @@ class BrowserObserver:
                     self.control_mode = "human"
                 except BaseException:
                     self.control_mode = "paused"
+                    with contextlib.suppress(Exception):
+                        await self.action_changed()
                     raise
             else:
                 if (
@@ -255,6 +278,15 @@ class BrowserObserver:
                         await asyncio.wait_for(
                             browser.get_browser_state_summary(cached=False), 5
                         )
+                        agent_observation, _ = await asyncio.wait_for(
+                            self.server._get_browser_state(), 3
+                        )
+                        if not isinstance(
+                            agent_observation, str
+                        ) or agent_observation.lower().startswith("error"):
+                            raise web.HTTPConflict(
+                                text="Fresh browser observation failed."
+                            )
                         self.control_mode = "agent"
                 elif operation == "click":
                     number = body.get("input_id")
@@ -355,6 +387,7 @@ class BrowserObserver:
                     "input_id": body.get("input_id"),
                     "control_epoch": self.control_epoch,
                     "state": state,
+                    "agent_observation": agent_observation,
                 }
             )
 
@@ -640,6 +673,11 @@ class BrowserObserver:
                 {
                     "generation": self.generation,
                     "browser_session_id": browser.id if browser else None,
+                    "available": browser is not None,
+                    "execution_state": self.execution_state,
+                    "control_mode": self.control_mode,
+                    "control_epoch": self.control_epoch,
+                    "manual_control_version": 1,
                 },
                 headers={"Cache-Control": "no-store"},
             )

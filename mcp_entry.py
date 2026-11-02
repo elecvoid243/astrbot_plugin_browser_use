@@ -50,6 +50,15 @@ class LocalBrowserServer(BrowserUseServer):
             raise RuntimeError(
                 "Browser is under human control or paused; explicitly hand control back first."
             )
+        observer.pending_browser_events[:] = [
+            event
+            for event in observer.pending_browser_events
+            if not event.event_completed_signal.is_set()
+        ]
+        if observer.pending_browser_events:
+            raise RuntimeError(
+                "Previous browser action is still settling; take control to recover."
+            )
         if metadata.get("control_epoch", 0) != observer.control_epoch:
             raise RuntimeError("Browser control epoch expired; observe the page again.")
         owner = metadata.get("owner")
@@ -212,6 +221,7 @@ class LocalBrowserServer(BrowserUseServer):
                 else CloseTabEvent(target_id=target)
             )
         dispatched = browser.event_bus.dispatch(event)
+        self.observer.pending_browser_events.append(dispatched)
         await dispatched
         await dispatched.event_result(raise_if_any=True, raise_if_none=False)
         if tool_name == "browser_close":
@@ -265,6 +275,7 @@ class LocalBrowserServer(BrowserUseServer):
                 )
             event = ClickElementEvent(node=node)
         dispatched = browser.event_bus.dispatch(event)
+        self.observer.pending_browser_events.append(dispatched)
         await dispatched
         details = await dispatched.event_result(raise_if_any=True)
         if before is not None:
@@ -299,6 +310,7 @@ class LocalBrowserServer(BrowserUseServer):
                 node=node, text=text, is_sensitive=True, sensitive_key_name="input"
             )
         )
+        self.observer.pending_browser_events.append(dispatched)
         await dispatched
         details = await dispatched.event_result(raise_if_any=True)
         if before is not None:
