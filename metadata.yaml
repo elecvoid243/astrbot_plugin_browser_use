@@ -1,6 +1,6 @@
 name: astrbot_plugin_browser_use
 display_name: Browser Use
 desc: 随插件启停本地 Browser Use MCP，使用独立 Python 和浏览器，支持 Windows x64 离线部署。
-version: v0.2.0
+version: v0.3.0
 author: elecvoid243
 astrbot_version: ">=4.28,<5"

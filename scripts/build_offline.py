@@ -101,6 +101,15 @@ def main() -> None:
     parser.add_argument("--astrbot-revision", help="Matching AstrBot Git commit SHA.")
     parser.add_argument("--dashboard-sha256", help="Matching Dashboard ZIP SHA256.")
     args = parser.parse_args()
+    revision = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+    ).strip()
+    if subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=no"], cwd=ROOT
+    ).strip():
+        parser.error(
+            "Commit tracked changes before packaging a distributable source revision."
+        )
     version = next(
         line.split(":", 1)[1].strip().removeprefix("v")
         for line in (ROOT / "metadata.yaml").read_text(encoding="utf-8").splitlines()
@@ -259,6 +268,10 @@ def main() -> None:
                     "chrome": args.chrome_version,
                     "pip": args.pip_version,
                     "plugin_version": version,
+                    "plugin_revision": revision,
+                    "manual_control_version": 1,
+                    "keyboard_input_version": 1,
+                    "pointer_input_version": 1,
                     "astrbot_revision": args.astrbot_revision,
                     "dashboard_sha256": args.dashboard_sha256,
                     "source_sha256": {

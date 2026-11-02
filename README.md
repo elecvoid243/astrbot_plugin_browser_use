@@ -13,7 +13,7 @@
 
 ## 用户安装：Windows x64 离线完整包
 
-1. 在有网的 Windows x64 机器按下方步骤构建，生成 `dist/astrbot_plugin_browser_use-0.2.0-win-x64.zip` 和 SHA256 文件，同时携带匹配的 AstrBot 后端与 Dashboard 发行构建。
+1. 在有网的 Windows x64 机器按下方步骤构建，生成 `dist/astrbot_plugin_browser_use-0.3.0-win-x64.zip` 和 SHA256 文件，同时携带匹配的 AstrBot 后端与 Dashboard 发行构建。
 2. 将 ZIP 复制到无外网机器，解压到任意目录，停止 AstrBot。
 3. 双击解压目录中的 `install.cmd`，选择实际的 AstrBot **data 目录**（其中已有 `plugins` 文件夹）。也可运行 `install.cmd -AstrBotDataDir "D:/AstrBot/data"`。
 4. 启动 AstrBot，插件将自动加载并连接 MCP。插件配置中的 Python、浏览器路径留空即可使用随包环境。
@@ -46,7 +46,7 @@
 # First build/package the matching Dashboard in the AstrBot repository.
 # node node_modules/vue-tsc/bin/vue-tsc.js --noEmit
 # node node_modules/vite/bin/vite.js build
-# python scripts/package_browser_observer_dashboard.py --output D:/delivery/dashboard.zip
+# python scripts/package_browser_observer_dashboard.py --plugin-revision <plugin-commit> --output D:/delivery/dashboard.zip
 # Use that repository's git rev-parse HEAD and Dashboard ZIP SHA256 below.
 python scripts/build_offline.py --astrbot-revision <40-character-commit> --dashboard-sha256 <64-character-sha256>
 # Build only the small plugin ZIP when a private runtime is already available.
@@ -55,14 +55,14 @@ python scripts/build_offline.py --source-only
 
 下载缓存在 `.build/downloads`，构建临时环境使用后自动清理。ZIP 中保留 `runtime/requirements.lock`、`runtime/manifest.json`、Python/浏览器及依赖包携带的许可文件。分发前应检查这些组件的再分发许可。
 
-`manifest.json` 包含插件、Python、pip、Browser Use、Chromium 版本、源码哈希、构建输入及来源和匹配前端校验值。校验外层 ZIP：`Get-FileHash .\dist\astrbot_plugin_browser_use-0.2.0-win-x64.zip -Algorithm SHA256`，与 `.zip.sha256` 对照。移动插件安装目录后，留空默认路径会在下次启用时重新定位；安装器仍拒绝覆盖已有插件，`plugin_data` 中的数据保留，但不同浏览器会话使用新 profile。
+`manifest.json` 包含插件、Python、pip、Browser Use、Chromium 版本、源码哈希、构建输入及来源和匹配前端校验值。校验外层 ZIP：`Get-FileHash .\dist\astrbot_plugin_browser_use-0.3.0-win-x64.zip -Algorithm SHA256`，与 `.zip.sha256` 对照。移动插件安装目录后，留空默认路径会在下次启用时重新定位；安装器仍拒绝覆盖已有插件，`plugin_data` 中的数据保留，但不同浏览器会话使用新 profile。
 
 ## 完整宿主验收与故障排查
 
 在具有 AstrBot 开发依赖、`aiohttp playwright psutil` 的测试解释器运行匹配后端仓库中的脚本。它从最终 ZIP 安装到新建的中文/空格目录，启动真实 AstrBot、SQLite、登录、插件管理、完整 Chat.vue 和 Agent 工具执行；仅以本地 OpenAI 兼容 fixture 代替模型服务。本机复用随包 Chromium，不下载测试浏览器。`--evidence-dir` 必须尚不存在。
 
 ```powershell
-python scripts/browser_observer_acceptance.py --plugin-zip D:/delivery/astrbot_plugin_browser_use-0.2.0-win-x64.zip --dashboard-dir D:/delivery/dist --evidence-dir D:/temporary/new-acceptance
+python scripts/browser_observer_acceptance.py --plugin-zip D:/delivery/astrbot_plugin_browser_use-0.3.0-win-x64.zip --dashboard-dir D:/delivery/dist --evidence-dir D:/temporary/new-acceptance
 ```
 
 该命令在 **AstrBot 仓库** 执行，生成截图、宿主日志、模型请求和逐项结果。测试为宿主进程注入临时的外部 DNS/套接字拦截，并设置失效的外网 HTTP 代理，网页/模型均使用回环；这是模拟无外网，不等于系统防火墙或断开网络的干净目标机。被拒绝的更新查询可能出现在日志中。实际无网 Windows 目标机和真实 vLLM 工具调用仍需分别验收。不要把模型 fixture 成功当作特定 vLLM 模型兼容证明。
@@ -212,3 +212,20 @@ Stale wheel samples receive `status: stale`, consume their ordered ID without
 CDP dispatch, and keep human ownership while the next image synchronizes. The
 client displays the rejection and does not replay that gesture. Other uncertain
 or invalid commands retain the existing fail-closed behavior.
+
+## 0.3.0 人工登录交付
+
+0.3.0 包含人工接管、键盘/中文提交与粘贴、滚动/双击、显式交还和断连恢复。不能仅比较宿主版本号：Dashboard 的 `browser-observer-build.json` 与插件 `runtime/manifest.json` 必须具有相同 `astrbot_revision` 和 `plugin_revision`；同时核对插件记录的 Dashboard ZIP SHA256。两仓库先提交最终源码，再打包；打包脚本拒绝未提交的受跟踪变更。宿主源码 ZIP 仍要求已有兼容的 AstrBot Python 环境，不是宿主依赖离线安装包。Windows x64 私有 Python/Chromium 随完整插件包提供，其他平台不能使用该二进制包。
+
+升级时停止宿主，保存配套旧后端、Dashboard、插件包及校验值，将旧插件目录移出 `data/plugins`，再使用原安装器。不要将旧插件与新插件同时加载；保留 `data/plugin_data`。当前浏览器会话不能跨宿主重启保存；同一任务内人工接管则保留原浏览器和登录态。回退也应停止宿主并整体恢复配套三个组件，保留独立数据备份。
+
+登录流程：Agent 打开登录页后点击“人工接管”，等待确认并聚焦远端输入框；输入中英文账号和测试密码，提交网页表单；确认登录成功后点击“交还 Agent”。失联、隐藏或刷新只会暂停，必须重新接管并明确交还。动作摘要隐藏输入，交还后的可见页面内容仍可能进入 Agent 的重新观察。
+
+最终 ZIP 的组合验收在 AstrBot 仓库执行：
+
+```powershell
+python scripts/browser_manual_control_acceptance.py --plugin-zip D:/delivery/astrbot_plugin_browser_use-0.3.0-win-x64.zip --dashboard-dir D:/delivery/dist --evidence-dir D:/temporary/new-h06 --login-handoff --pointer-input --text-input --lost-key-target --recovery
+# Repeat with a different evidence directory and --handoff-boundaries.
+```
+
+脚本使用原 PowerShell 安装器，搬迁含中文/空格的完整 data 树，路径配置留空以验证随包环境；校对源码哈希、配套提交，执行真实宿主登录、普通账户/管理员和私有 Chromium 登录表单。只在临时解释器注入 Python socket/DNS 审计与安装器拦截；私有 Chromium 使用不可达 SOCKS 代理、仅回环绕过、禁用 QUIC 与外部解析，并采样进程连接与资源。审计先实际尝试并拒绝测试外部地址，记录加载它的宿主/私有解释器及浏览器约束，不记录输入内容。这不是内核防火墙或物理断网，也不能证明所有原生网络路径。真实 vLLM、实体 Windows 输入法候选窗口、其他操作系统仍需独立验证。截图、模型请求、网络审计、延迟/资源和清理结果保存在新建证据目录。

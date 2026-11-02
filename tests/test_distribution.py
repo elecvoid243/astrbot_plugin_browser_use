@@ -14,7 +14,7 @@ def test_source_zip_contains_local_imports_and_runtime_lock():
         [sys.executable, str(root / "scripts/build_offline.py"), "--source-only"],
         check=True,
     )
-    archive_path = root / "dist" / f"{root.name}-0.2.0-source.zip"
+    archive_path = root / "dist" / f"{root.name}-0.3.0-source.zip"
     with zipfile.ZipFile(archive_path) as archive:
         names = set(archive.namelist())
         for member in names:
