@@ -225,7 +225,8 @@ or invalid commands retain the existing fail-closed behavior.
 
 ```powershell
 python scripts/browser_manual_control_acceptance.py --plugin-zip D:/delivery/astrbot_plugin_browser_use-0.3.0-win-x64.zip --dashboard-dir D:/delivery/dist --evidence-dir D:/temporary/new-h06 --login-handoff --pointer-input --text-input --lost-key-target --recovery
-# Repeat with a different evidence directory and --handoff-boundaries.
+# For the separate one-step-budget regression, use a new directory and
+# --handoff-boundaries, omitting --login-handoff.
 ```
 
 脚本使用原 PowerShell 安装器，搬迁含中文/空格的完整 data 树，路径配置留空以验证随包环境；校对源码哈希、配套提交，执行真实宿主登录、普通账户/管理员和私有 Chromium 登录表单。只在临时解释器注入 Python socket/DNS 审计与安装器拦截；私有 Chromium 使用不可达 SOCKS 代理、仅回环绕过、禁用 QUIC 与外部解析，并采样进程连接与资源。审计先实际尝试并拒绝测试外部地址，记录加载它的宿主/私有解释器及浏览器约束，不记录输入内容。这不是内核防火墙或物理断网，也不能证明所有原生网络路径。真实 vLLM、实体 Windows 输入法候选窗口、其他操作系统仍需独立验证。截图、模型请求、网络审计、延迟/资源和清理结果保存在新建证据目录。
