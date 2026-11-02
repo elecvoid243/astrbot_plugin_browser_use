@@ -842,3 +842,176 @@ async def test_keyboard_order_privacy_and_cleanup(observed_server):
 
     finally:
         await observer.close()
+
+
+@pytest.mark.parametrize("fault", ["error", "timeout"])
+@pytest.mark.parametrize(
+    "operation",
+    ["release", "disconnect", "expiry", "stop_execution", "stop", "close", "disable"],
+)
+async def test_key_release_fault_cannot_preserve_control_or_block_termination(
+    observed_server, monkeypatch, fault, operation
+):
+    """Revoke credentials and keep termination reachable after an uncertain keyUp.
+
+    Args:
+        observed_server: Private observer and stub browser execution wrapper.
+        monkeypatch: Accelerate only the controller lease deadline.
+        fault: Whether the original target raises or never acknowledges keyUp.
+        operation: Handback, revocation or terminal operation under test.
+    """
+    server, observer, upstream = observed_server
+    observer.owner = "trusted-chat"
+    state = observer.read_state.return_value[2]
+    observer.read_state.return_value = (server.browser_session, object(), state)
+    identity = {
+        "generation": observer.generation,
+        "browser_session_id": "browser",
+        "owner": "trusted-chat",
+        "client_id": "human",
+    }
+    original_sleep = asyncio.sleep
+
+    async def lease_sleep(delay):
+        """Advance only the silent-controller lease.
+
+        Args:
+            delay: Requested asynchronous sleep duration.
+        """
+        await original_sleep(0 if delay == 30 else delay)
+
+    async def broken_keyup(**kwargs):
+        """Simulate a detached or unresponsive original CDP session.
+
+        Args:
+            **kwargs: Original key release request parameters.
+        """
+        if fault == "timeout":
+            await asyncio.Event().wait()
+        raise RuntimeError("Original CDP target is detached")
+
+    async def close_browser():
+        """Confirm destruction of the stub browser lifetime."""
+        server.browser_session = None
+
+    bad = AsyncMock(side_effect=broken_keyup)
+    good = AsyncMock()
+    cdp_bad = SimpleNamespace(
+        session_id="detached",
+        cdp_client=SimpleNamespace(
+            send=SimpleNamespace(Input=SimpleNamespace(dispatchKeyEvent=bad))
+        ),
+    )
+    cdp_good = SimpleNamespace(
+        session_id="live",
+        cdp_client=SimpleNamespace(
+            send=SimpleNamespace(Input=SimpleNamespace(dispatchKeyEvent=good))
+        ),
+    )
+    server._close_all_sessions = AsyncMock(side_effect=close_browser)
+    await observer.start()
+    url = (
+        f"http://127.0.0.1:{json.loads(observer.discovery.read_text())['port']}/manual"
+    )
+    try:
+        async with aiohttp.ClientSession(
+            headers={"Authorization": "Bearer secret"}
+        ) as http:
+            async with http.post(
+                url, json={**identity, "operation": "acquire"}
+            ) as response:
+                epoch = (await response.json())["control_epoch"]
+            observer._held_keys = {
+                "ShiftLeft": (cdp_bad, {"code": "ShiftLeft", "key": "Shift"}),
+                "ControlLeft": (cdp_good, {"code": "ControlLeft", "key": "Control"}),
+            }
+            if operation == "expiry":
+                monkeypatch.setattr(asyncio, "sleep", lease_sleep)
+                async with http.post(
+                    url,
+                    json={**identity, "operation": "heartbeat", "control_epoch": epoch},
+                ) as response:
+                    assert response.status == 200
+                await asyncio.wait_for(asyncio.shield(observer._human_expiry), 5)
+            else:
+                endpoint = (
+                    url
+                    if operation in {"release", "disconnect"}
+                    else url.replace(
+                        "/manual",
+                        "/action/cancel"
+                        if operation == "stop_execution"
+                        else "/control",
+                    )
+                )
+                async with http.post(
+                    endpoint,
+                    json={
+                        **identity,
+                        "operation": operation,
+                        "control_epoch": epoch,
+                        "stop_execution": operation == "stop_execution",
+                    },
+                ) as response:
+                    assert response.status == (409 if operation == "release" else 200)
+            assert good.await_count == 1, (
+                "One failed target skipped cleanup on a different session"
+            )
+            assert observer.human is None and observer.control_epoch > epoch
+            assert observer.control_mode != "human"
+            assert upstream.await_count == 0
+            async with http.post(
+                url, json={**identity, "operation": "heartbeat", "control_epoch": epoch}
+            ) as response:
+                assert response.status == 409
+            if operation not in {"close", "disable"}:
+                assert observer.control_mode == "paused"
+                assert "ShiftLeft" in observer._held_keys
+                if operation == "release":
+                    async with http.post(
+                        url, json={**identity, "operation": "acquire"}
+                    ) as response:
+                        assert response.status == 409
+                    assert observer.human is None and observer.control_mode == "paused"
+                async with http.post(
+                    url.replace("/manual", "/control"),
+                    json={**identity, "operation": "close"},
+                ) as response:
+                    assert response.status == 200
+            server._close_all_sessions.assert_awaited_once()
+            assert server.browser_session is None and not observer._held_keys
+            assert good.await_count == 1
+    finally:
+        await observer.close()
+
+
+async def test_key_release_deadline_is_shared_across_lost_keys(observed_server):
+    """Several silent targets must not multiply the terminal operation deadline.
+
+    Args:
+        observed_server: Observer with controlled original CDP sessions.
+    """
+    _, observer, _ = observed_server
+
+    async def silent_keyup(**kwargs):
+        """Leave an individual key release unacknowledged.
+
+        Args:
+            **kwargs: Original key release request parameters.
+        """
+        await asyncio.Event().wait()
+
+    silent = AsyncMock(side_effect=silent_keyup)
+    cdp = SimpleNamespace(
+        session_id="silent",
+        cdp_client=SimpleNamespace(
+            send=SimpleNamespace(Input=SimpleNamespace(dispatchKeyEvent=silent))
+        ),
+    )
+    observer._held_keys = {
+        code: (cdp, {"code": code}) for code in ("ShiftLeft", "ControlLeft", "AltLeft")
+    }
+    with pytest.raises(aiohttp.web.HTTPConflict):
+        await asyncio.wait_for(observer.release_keys(), 4)
+    assert silent.await_count == 3 and len(observer._held_keys) == 3
+    assert observer.control_mode == "paused"

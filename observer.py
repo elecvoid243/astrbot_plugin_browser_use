@@ -163,24 +163,42 @@ class BrowserObserver:
         """Release keys on their original CDP session before changing admission.
 
         Raises:
-            Exception: Chromium cannot confirm release; admission stays paused.
+            HTTPConflict: Some keys remain unconfirmed after all releases are attempted.
+                Admission stays paused and failed keys are retained for retry or close.
         """
-        for code, (cdp, params) in list(self._held_keys.items()):
-            await asyncio.wait_for(
-                cdp.cdp_client.send.Input.dispatchKeyEvent(
-                    params={
-                        **params,
-                        "type": "keyUp",
-                        "modifiers": 0,
-                        "text": "",
-                        "unmodifiedText": "",
-                        "autoRepeat": False,
-                    },
-                    session_id=cdp.session_id,
-                ),
-                3,
+        keys = list(self._held_keys.items())
+        # Releases are independent. Share one bounded deadline even if many targets died.
+        results = await asyncio.gather(
+            *(
+                asyncio.wait_for(
+                    cdp.cdp_client.send.Input.dispatchKeyEvent(
+                        params={
+                            **params,
+                            "type": "keyUp",
+                            "modifiers": 0,
+                            "text": "",
+                            "unmodifiedText": "",
+                            "autoRepeat": False,
+                        },
+                        session_id=cdp.session_id,
+                    ),
+                    3,
+                )
+                for _, (cdp, params) in keys
+            ),
+            return_exceptions=True,
+        )
+        failed = False
+        for (code, _), result in zip(keys, results):
+            if isinstance(result, BaseException):
+                failed = True
+            else:
+                self._held_keys.pop(code, None)
+        if failed:
+            self.control_mode = "paused"
+            raise web.HTTPConflict(
+                text="Key release unconfirmed; browser remains paused. Close the browser before continuing."
             )
-            self._held_keys.pop(code, None)
 
     async def manual(self, request):
         """Serialize typed human commands with Agent admission in this runtime.
@@ -223,6 +241,7 @@ class BrowserObserver:
                 self.control_mode = "acquiring"
                 self.control_epoch += 1
                 try:
+                    await self.release_keys()
                     await self.action_changed()
                     if self.current_action is not None:
                         self.cancelled_actions.append(self.current_action["action_id"])
@@ -276,7 +295,13 @@ class BrowserObserver:
                     raise web.HTTPConflict(text="Browser input is paused.")
                 if operation in {"release", "disconnect"}:
                     self.control_mode = "paused"
-                    await self.release_keys()
+                    self.human = None
+                    self.control_epoch += 1
+                    if operation == "release":
+                        await self.release_keys()
+                    else:
+                        with contextlib.suppress(Exception):
+                            await self.release_keys()
                     if self._held_mouse is not None:
                         cdp, x, y = self._held_mouse
                         await asyncio.wait_for(
@@ -293,9 +318,6 @@ class BrowserObserver:
                             3,
                         )
                         self._held_mouse = None
-                    self.human = None
-                    self.control_epoch += 1
-                    self.control_mode = "paused"
                     # Existing element indices cannot survive human page changes.
                     browser._cached_browser_state_summary = None
                     browser._cached_selector_map = {}
@@ -511,10 +533,10 @@ class BrowserObserver:
                     async with self._control_lock:
                         if self.control_epoch == epoch:
                             self.control_mode = "paused"
-                            await self.release_keys()
                             self.human = None
                             self.control_epoch += 1
-                            self.control_mode = "paused"
+                            with contextlib.suppress(Exception):
+                                await self.release_keys()
                             await self.action_changed()
 
                 self._human_expiry = asyncio.create_task(expire())
@@ -611,13 +633,14 @@ class BrowserObserver:
             raise web.HTTPConflict()
         action_id = body.get("action_id")
         if body.get("stop_execution"):
-            self.execution_state = "stopped"
-            self.control_mode = "paused"
-            await self.release_keys()
-            self.human = None
-            self.control_epoch += 1
-            self.control_mode = "paused"
-            self.revoked_leases.append(body.get("lease"))
+            async with self._control_lock:
+                self.execution_state = "stopped"
+                self.control_mode = "paused"
+                self.human = None
+                self.control_epoch += 1
+                self.revoked_leases.append(body.get("lease"))
+                with contextlib.suppress(Exception):
+                    await self.release_keys()
         self.cancelled_actions.append(action_id)
         if self.current_action and self.current_action["action_id"] == action_id:
             action = self.current_action
@@ -673,11 +696,11 @@ class BrowserObserver:
                 raise web.HTTPConflict(text="Browser session expired.")
             self.execution_state = "stopped"
             self.control_mode = "paused"
-            await self.release_keys()
             self.human = None
             self.control_epoch += 1
-            self.control_mode = "paused"
             self.revoked_leases.append(body.get("lease"))
+            with contextlib.suppress(Exception):
+                await self.release_keys()
             self.highlight = None
             if self.current_action:
                 self.cancelled_actions.append(self.current_action["action_id"])
@@ -700,6 +723,9 @@ class BrowserObserver:
                 }
             if operation in {"close", "disable"}:
                 await self.server._close_all_sessions()
+                # Only confirmed browser destruction resolves unacknowledged keys.
+                self._held_keys.clear()
+                self._held_mouse = None
                 self.owner = None
                 self.execution_state = (
                     "disabled" if operation == "disable" else "closed"
