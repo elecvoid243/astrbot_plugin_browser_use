@@ -1388,3 +1388,114 @@ async def test_capture_session_preserves_viewport_and_is_bounded(
         await observer.capture_snapshot(browser, cdp, {**live, "tab_id": "next"})
     assert observer._snapshot_session is None
     assert factory.call_count == 4
+
+
+@pytest.mark.parametrize(
+    "ending", ["up", "cancel", "disconnect", "navigation", "uncertain"]
+)
+async def test_held_drag_ordering_scroll_and_cleanup(observed_server, ending):
+    """Keep a drag bound to its page and release it on every exit.
+
+    Args:
+        observed_server: Isolated HTTP runtime with controlled CDP dispatch.
+        ending: Gesture termination or failure to exercise.
+    """
+    server, observer, _ = observed_server
+    dispatch = AsyncMock()
+    observer.owner = "trusted-chat"
+    state = {
+        "generation": observer.generation,
+        "browser_session_id": "browser",
+        "tab_id": "tab",
+        "document_id": "doc",
+        "viewport_width": 1280,
+        "viewport_height": 720,
+        "scroll_x": 0,
+        "scroll_y": 0,
+        "position_revision": 0,
+    }
+    cdp = SimpleNamespace(
+        session_id="cdp",
+        cdp_client=SimpleNamespace(
+            send=SimpleNamespace(Input=SimpleNamespace(dispatchMouseEvent=dispatch))
+        ),
+    )
+    observer.read_state.return_value = (server.browser_session, cdp, state)
+    await observer.start()
+    identity = {
+        "generation": observer.generation,
+        "browser_session_id": "browser",
+        "owner": "trusted-chat",
+        "client_id": "socket",
+    }
+    try:
+        async with aiohttp.ClientSession(
+            headers={"Authorization": "Bearer secret"}
+        ) as http:
+            url = f"http://127.0.0.1:{json.loads(observer.discovery.read_text())['port']}/manual"
+            async with http.post(
+                url, json={**identity, "operation": "acquire"}
+            ) as response:
+                assert response.status == 200
+                epoch = (await response.json())["control_epoch"]
+            command = {
+                **identity,
+                "control_epoch": epoch,
+                "operation": "pointer",
+                "input_id": 1,
+                "phase": "down",
+                "x": 100,
+                "y": 80,
+                "target": dict(state),
+            }
+            for _ in range(2):
+                async with http.post(url, json=command) as response:
+                    assert (await response.json())["status"] == "applied"
+            assert dispatch.await_count == 1
+            assert observer._held_mouse is not None
+            state.update(scroll_y=100, position_revision=1)
+            async with http.post(
+                url, json={**command, "phase": "move", "input_id": 2, "x": 200}
+            ) as response:
+                assert (await response.json())["status"] == "applied"
+            assert dispatch.await_args.kwargs["params"] == {
+                "type": "mouseMoved",
+                "x": 200,
+                "y": 80,
+                "button": "left",
+                "buttons": 1,
+                "clickCount": 1,
+            }
+            if ending == "navigation":
+                state["document_id"] = "another-page"
+            if ending == "uncertain":
+                dispatch.side_effect = [TimeoutError(), None]
+            final = {
+                **command,
+                "phase": "up" if ending != "cancel" else "cancel",
+                "input_id": 3,
+                "x": 300,
+            }
+            if ending == "disconnect":
+                final["operation"] = "disconnect"
+            async with http.post(url, json=final) as response:
+                assert response.status == 200
+                result = await response.json()
+                assert result["status"] == (
+                    "stale"
+                    if ending == "navigation"
+                    else "uncertain"
+                    if ending == "uncertain"
+                    else "applied"
+                )
+            assert observer._held_mouse is None
+            assert observer._drag_target is None
+            assert dispatch.await_args.kwargs["params"]["type"] == "mouseReleased"
+            if ending != "up":
+                assert dispatch.await_args.kwargs["params"]["x"] == -1
+            else:
+                assert dispatch.await_args.kwargs["params"]["x"] == 300
+            if ending in {"disconnect", "uncertain"}:
+                assert observer.control_mode == "paused"
+    finally:
+        await observer.close()

@@ -84,6 +84,7 @@ class BrowserObserver:
         self._human_expiry = None
         self._held_keys = {}
         self._held_mouse = None
+        self._drag_target = None
         self.pending_browser_events = []
         self._snapshot_lock = asyncio.Lock()
         self._snapshot_session = None
@@ -137,6 +138,7 @@ class BrowserObserver:
             "manual_control_version": 1,
             "keyboard_input_version": 1,
             "pointer_input_version": 1,
+            "drag_input_version": 1,
             "viewport_resize_version": 1,
             "applied_input_id": self.applied_input_id,
             "url": "",
@@ -243,6 +245,7 @@ class BrowserObserver:
                 failed = True
             elif self._held_mouse is mouse:
                 self._held_mouse = None
+                self._drag_target = None
         if failed:
             self.control_mode = "paused"
             raise web.HTTPConflict(
@@ -457,6 +460,7 @@ class BrowserObserver:
                         self.control_mode = "agent"
                 elif operation in {
                     "click",
+                    "pointer",
                     "wheel",
                     "key",
                     "text",
@@ -472,22 +476,66 @@ class BrowserObserver:
                         raise web.HTTPConflict(text="Input sequence expired.")
                     _, cdp, state = await asyncio.wait_for(self.read_state(), 3)
                     target = body.get("target", {})
-                    if operation != "reset_keys" and (
-                        cdp is None
-                        or (
-                            "position_revision" in target
-                            and target["position_revision"]
-                            != state.get("position_revision")
-                        )
-                        or any(
-                            target.get(key) != state.get(key)
-                            for key in (
-                                "tab_id",
-                                "document_id",
-                                "viewport_width",
-                                "viewport_height",
-                                "scroll_x",
-                                "scroll_y",
+                    phase = body.get("phase")
+                    if operation == "pointer" and phase not in {
+                        "down",
+                        "move",
+                        "up",
+                        "cancel",
+                    }:
+                        raise web.HTTPBadRequest(text="Invalid pointer phase.")
+                    continuation = operation == "pointer" and phase in {"move", "up"}
+                    drag_target = self._drag_target
+                    if continuation and (
+                        self._held_mouse is None or drag_target is None
+                    ):
+                        raise web.HTTPConflict(text="No pointer gesture is active.")
+                    if self._held_mouse is not None and operation not in {
+                        "pointer",
+                        "reset_keys",
+                    }:
+                        await self.release_keys()
+                        raise web.HTTPConflict(text="Pointer gesture interrupted.")
+                    if (
+                        operation == "pointer"
+                        and phase == "down"
+                        and self._held_mouse is not None
+                    ):
+                        await self.release_keys()
+                        raise web.HTTPConflict(text="Pointer gesture already active.")
+                    # A held drag can scroll the page. Its coordinates remain bound
+                    # to the original document and viewport, never a replacement tab.
+                    target_fields = (
+                        "tab_id",
+                        "document_id",
+                        "viewport_width",
+                        "viewport_height",
+                    )
+                    if (
+                        operation != "reset_keys"
+                        and not (operation == "pointer" and phase == "cancel")
+                        and (
+                            cdp is None
+                            or (
+                                continuation
+                                and (
+                                    any(
+                                        target.get(key) != drag_target.get(key)
+                                        for key in target_fields
+                                    )
+                                    or self._held_mouse[0].session_id != cdp.session_id
+                                )
+                            )
+                            or (
+                                not continuation
+                                and "position_revision" in target
+                                and target["position_revision"]
+                                != state.get("position_revision")
+                            )
+                            or any(
+                                target.get(key) != state.get(key)
+                                for key in target_fields
+                                + (() if continuation else ("scroll_x", "scroll_y"))
                             )
                         )
                     ):
@@ -505,7 +553,9 @@ class BrowserObserver:
                         self.publish("state", state)
                         return web.json_response(self.human["last_ack"])
                     params = None
-                    if operation in {"click", "wheel"}:
+                    if operation in {"click", "wheel", "pointer"} and not (
+                        operation == "pointer" and phase == "cancel"
+                    ):
                         x, y = body.get("x"), body.get("y")
                         if (
                             any(
@@ -612,7 +662,37 @@ class BrowserObserver:
                         "control_epoch": self.control_epoch,
                     }
                     try:
-                        if operation == "click":
+                        if operation == "pointer":
+                            if phase == "cancel":
+                                await self.release_keys()
+                            else:
+                                self._held_mouse = (cdp, x, y)
+                                if phase == "down":
+                                    self._drag_target = {
+                                        key: state.get(key) for key in target_fields
+                                    }
+                                await asyncio.wait_for(
+                                    cdp.cdp_client.send.Input.dispatchMouseEvent(
+                                        params={
+                                            "type": {
+                                                "down": "mousePressed",
+                                                "move": "mouseMoved",
+                                                "up": "mouseReleased",
+                                            }[phase],
+                                            "x": x,
+                                            "y": y,
+                                            "button": "left",
+                                            "buttons": 0 if phase == "up" else 1,
+                                            "clickCount": 1,
+                                        },
+                                        session_id=cdp.session_id,
+                                    ),
+                                    3,
+                                )
+                                if phase == "up":
+                                    self._held_mouse = None
+                                    self._drag_target = None
+                        elif operation == "click":
                             for kind in ("mousePressed", "mouseReleased"):
                                 self._held_mouse = (cdp, x, y)
                                 await asyncio.wait_for(
@@ -672,7 +752,9 @@ class BrowserObserver:
                             await self.release_keys()
                         return web.json_response(self.human["last_ack"])
                     self.applied_input_id = number
-                    if operation in {"text", "key", "click", "wheel"}:
+                    if operation in {"text", "key", "click", "wheel"} or (
+                        operation == "pointer" and phase == "up"
+                    ):
                         # The timeline contains categories only, including for passwords.
                         self.recent_actions.append(
                             {
@@ -680,7 +762,7 @@ class BrowserObserver:
                                 "kind": "scroll"
                                 if operation == "wheel"
                                 else "click"
-                                if operation == "click"
+                                if operation in {"click", "pointer"}
                                 else "type",
                                 "actor": "human",
                                 "status": "succeeded",
@@ -912,6 +994,7 @@ class BrowserObserver:
                 # Only confirmed browser destruction resolves unacknowledged keys.
                 self._held_keys.clear()
                 self._held_mouse = None
+                self._drag_target = None
                 self.owner = None
                 self.execution_state = (
                     "disabled" if operation == "disable" else "closed"
@@ -943,6 +1026,7 @@ class BrowserObserver:
             "manual_control_version": 1,
             "keyboard_input_version": 1,
             "pointer_input_version": 1,
+            "drag_input_version": 1,
             "viewport_resize_version": 1,
             "applied_input_id": state.get("applied_input_id", self.applied_input_id),
             **self.action_state(state.get("browser_session_id")),
@@ -1112,6 +1196,7 @@ class BrowserObserver:
                     "manual_control_version": 1,
                     "keyboard_input_version": 1,
                     "pointer_input_version": 1,
+                    "drag_input_version": 1,
                     "viewport_resize_version": 1,
                     "applied_input_id": self.applied_input_id,
                 },
