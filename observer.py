@@ -21,8 +21,10 @@ from PIL import Image
 
 from observation_queue import ACTION_LIMIT, ObservationQueue
 
-MAX_IMAGE_BYTES = 512 * 1024
-MAX_EVENT_BYTES = 768 * 1024
+MAX_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_EVENT_BYTES = 3 * 1024 * 1024
+MAX_FRAME_WIDTH = 2560
+MAX_FRAME_HEIGHT = 1600
 FRAME_INTERVAL = 0.25
 HUMAN_FRAME_INTERVAL = 0.1
 # A scroll revision also covers nested scrollers without treating animation frames
@@ -100,6 +102,7 @@ class BrowserObserver:
         app.router.add_post("/action/cancel", self.cancel_action)
         app.router.add_post("/control", self.control)
         app.router.add_post("/manual", self.manual)
+        app.router.add_post("/viewport", self.viewport)
         self.runner = web.AppRunner(app, access_log=None)
         await self.runner.setup()
         site = web.TCPSite(self.runner, "127.0.0.1", 0)
@@ -134,6 +137,7 @@ class BrowserObserver:
             "manual_control_version": 1,
             "keyboard_input_version": 1,
             "pointer_input_version": 1,
+            "viewport_resize_version": 1,
             "applied_input_id": self.applied_input_id,
             "url": "",
             "title": "",
@@ -244,6 +248,91 @@ class BrowserObserver:
             raise web.HTTPConflict(
                 text="Input release unconfirmed; browser remains paused. Close the browser before continuing."
             )
+
+    async def resize_viewport(self, browser, cdp, body):
+        """Apply bounded display metrics to the runtime-selected target.
+
+        Args:
+            browser: Owned browser whose action admission is locked.
+            cdp: Session for the current browser target.
+            body: Requested width, height and device scale.
+
+        Raises:
+            HTTPBadRequest: Dimensions exceed the capture budget.
+        """
+        width, height, scale = (
+            body.get(key) for key in ("width", "height", "device_scale_factor")
+        )
+        if (
+            type(width) is not int
+            or type(height) is not int
+            or not 320 <= width <= 2560
+            or not 240 <= height <= 1600
+            or type(scale) not in (int, float)
+            or not math.isfinite(scale)
+            or not 1 <= scale <= 2
+        ):
+            raise web.HTTPBadRequest(text="Invalid viewport dimensions.")
+        scale = min(scale, MAX_FRAME_WIDTH / width, MAX_FRAME_HEIGHT / height)
+        await self.release_keys()
+        await asyncio.wait_for(
+            cdp.cdp_client.send.Emulation.setDeviceMetricsOverride(
+                params={
+                    "width": width,
+                    "height": height,
+                    "deviceScaleFactor": scale,
+                    "mobile": False,
+                },
+                session_id=cdp.session_id,
+            ),
+            3,
+        )
+        if hasattr(browser, "browser_profile"):
+            browser.browser_profile.viewport = {"width": width, "height": height}
+            browser.browser_profile.device_scale_factor = scale
+        self.highlight = None
+        self._refresh_stream = True
+
+    async def viewport(self, request):
+        """Resize an observed browser when no human or Agent action owns it.
+
+        Args:
+            request: Credential-protected request carrying a trusted chat owner.
+
+        Returns:
+            Fresh metadata after applying the requested viewport.
+
+        Raises:
+            HTTPUnauthorized: Bridge credentials are invalid.
+            HTTPConflict: Ownership or the selected tab changed, or input is active.
+        """
+        if not hmac.compare_digest(
+            request.headers.get("Authorization", ""), f"Bearer {self.token}"
+        ):
+            raise web.HTTPUnauthorized()
+        body = await request.json()
+        async with self._control_lock:
+            browser = self.server.browser_session
+            if (
+                self._closed
+                or browser is None
+                or body.get("owner") != self.owner
+                or body.get("generation") != self.generation
+                or body.get("browser_session_id") != browser.id
+                or body.get("tab_id") != browser.agent_focus_target_id
+                or self.human is not None
+                or self.control_mode == "acquiring"
+                or self.current_action is not None
+            ):
+                raise web.HTTPConflict(
+                    text="Viewport is currently owned by another operation."
+                )
+            _, cdp, _ = await self.read_state()
+            if cdp is None:
+                raise web.HTTPConflict(text="No current browser target.")
+            await self.resize_viewport(browser, cdp, body)
+            _, _, state = await self.read_state()
+            return web.json_response(self.publish("state", state))
 
     async def manual(self, request):
         """Serialize typed human commands with Agent admission in this runtime.
@@ -366,7 +455,14 @@ class BrowserObserver:
                                 text="Fresh browser observation failed."
                             )
                         self.control_mode = "agent"
-                elif operation in {"click", "wheel", "key", "text", "reset_keys"}:
+                elif operation in {
+                    "click",
+                    "wheel",
+                    "key",
+                    "text",
+                    "reset_keys",
+                    "resize",
+                }:
                     number = body.get("input_id")
                     if type(number) is not int or number < 1:
                         raise web.HTTPBadRequest(text="Invalid input number.")
@@ -396,23 +492,18 @@ class BrowserObserver:
                         )
                     ):
                         await self.release_keys()
-                        if operation == "wheel":
-                            # Scroll animation can outlive a displayed frame. Reject
-                            # this replaceable sample, consume its ID, and keep the
-                            # explicit human owner while the client resynchronizes.
-                            self.human["last_input"] = number
-                            self.human["last_ack"] = {
-                                "operation": operation,
-                                "input_id": number,
-                                "status": "stale",
-                                "control_epoch": self.control_epoch,
-                                "state": state,
-                            }
-                            self.publish("state", state)
-                            return web.json_response(self.human["last_ack"])
-                        raise web.HTTPConflict(
-                            text="Displayed target expired; refresh observation."
-                        )
+                        # The request has not executed. Consume its ID and keep
+                        # ownership, allowing a new explicit input after fresh pixels.
+                        self.human["last_input"] = number
+                        self.human["last_ack"] = {
+                            "operation": operation,
+                            "input_id": number,
+                            "status": "stale",
+                            "control_epoch": self.control_epoch,
+                            "state": state,
+                        }
+                        self.publish("state", state)
+                        return web.json_response(self.human["last_ack"])
                     params = None
                     if operation in {"click", "wheel"}:
                         x, y = body.get("x"), body.get("y")
@@ -552,6 +643,8 @@ class BrowserObserver:
                                 ),
                                 3,
                             )
+                        elif operation == "resize":
+                            await self.resize_viewport(browser, cdp, body)
                         elif operation == "reset_keys":
                             await self.release_keys()
                         elif operation == "text":
@@ -623,6 +716,16 @@ class BrowserObserver:
                             await self.action_changed()
 
                 self._human_expiry = asyncio.create_task(expire())
+            if operation == "heartbeat":
+                # A lease renewal must not depend on a document execution context
+                # surviving navigation or a slow page answering Runtime.evaluate.
+                return web.json_response(
+                    {
+                        "operation": operation,
+                        "status": "applied",
+                        "control_epoch": self.control_epoch,
+                    }
+                )
             _, _, state = await asyncio.wait_for(self.read_state(), 3)
             state.update(
                 control_mode=self.control_mode, control_epoch=self.control_epoch
@@ -840,6 +943,7 @@ class BrowserObserver:
             "manual_control_version": 1,
             "keyboard_input_version": 1,
             "pointer_input_version": 1,
+            "viewport_resize_version": 1,
             "applied_input_id": state.get("applied_input_id", self.applied_input_id),
             **self.action_state(state.get("browser_session_id")),
             "type": kind,
@@ -907,8 +1011,19 @@ class BrowserObserver:
                 shot = await cached[2].send.Page.captureScreenshot(
                     params={
                         "format": "jpeg",
-                        "quality": 65,
+                        "quality": 90,
                         "captureBeyondViewport": False,
+                        "clip": {
+                            "x": state["scroll_x"],
+                            "y": state["scroll_y"],
+                            "width": state["viewport_width"],
+                            "height": state["viewport_height"],
+                            "scale": min(
+                                2,
+                                MAX_FRAME_WIDTH / state["viewport_width"],
+                                MAX_FRAME_HEIGHT / state["viewport_height"],
+                            ),
+                        },
                     },
                     session_id=cached[3],
                 )
@@ -937,12 +1052,21 @@ class BrowserObserver:
             raise web.HTTPConflict(text="Page changed; refresh observation.")
         raw = base64.b64decode(shot["data"])
         with Image.open(io.BytesIO(raw)) as picture:
-            if picture.width > 1280 or picture.height > 720:
-                picture.thumbnail((1280, 720))
+            if picture.width > MAX_FRAME_WIDTH or picture.height > MAX_FRAME_HEIGHT:
+                picture.thumbnail((MAX_FRAME_WIDTH, MAX_FRAME_HEIGHT))
                 encoded = io.BytesIO()
-                picture.convert("RGB").save(encoded, format="JPEG", quality=65)
+                picture.convert("RGB").save(encoded, format="JPEG", quality=90)
                 raw = encoded.getvalue()
                 shot["data"] = base64.b64encode(raw).decode("ascii")
+        if len(raw) > MAX_IMAGE_BYTES:
+            with Image.open(io.BytesIO(raw)) as picture:
+                for quality in (80, 65, 45):
+                    encoded = io.BytesIO()
+                    picture.convert("RGB").save(encoded, format="JPEG", quality=quality)
+                    raw = encoded.getvalue()
+                    if len(raw) <= MAX_IMAGE_BYTES:
+                        break
+            shot["data"] = base64.b64encode(raw).decode("ascii")
         if len(raw) > MAX_IMAGE_BYTES:
             raise web.HTTPRequestEntityTooLarge(
                 max_size=MAX_IMAGE_BYTES, actual_size=len(raw)
@@ -988,6 +1112,7 @@ class BrowserObserver:
                     "manual_control_version": 1,
                     "keyboard_input_version": 1,
                     "pointer_input_version": 1,
+                    "viewport_resize_version": 1,
                     "applied_input_id": self.applied_input_id,
                 },
                 headers={"Cache-Control": "no-store"},
@@ -1194,9 +1319,9 @@ class BrowserObserver:
                                 cdp.cdp_client.send.Page.startScreencast(
                                     params={
                                         "format": "jpeg",
-                                        "quality": 65,
-                                        "maxWidth": 1280,
-                                        "maxHeight": 720,
+                                        "quality": 90,
+                                        "maxWidth": MAX_FRAME_WIDTH,
+                                        "maxHeight": MAX_FRAME_HEIGHT,
                                         "everyNthFrame": 1,
                                     },
                                     session_id=cdp.session_id,
@@ -1239,6 +1364,11 @@ class BrowserObserver:
                     )
                     if cdp is not None and (
                         self.control_mode == "human"
+                        or (
+                            event is not None
+                            and not coordinates_match
+                            and time.monotonic() - last_frame >= 1
+                        )
                         or (event is None and time.monotonic() - last_frame >= 1)
                     ):
                         # Static pages can stop emitting screencast frames after
@@ -1255,8 +1385,8 @@ class BrowserObserver:
                             width, height = picture.size
                         if (
                             len(raw) <= MAX_IMAGE_BYTES
-                            and 0 < width <= 1280
-                            and 0 < height <= 720
+                            and 0 < width <= MAX_FRAME_WIDTH
+                            and 0 < height <= MAX_FRAME_HEIGHT
                             and self.server.browser_session is browser
                             and browser.agent_focus_target_id == target
                         ):

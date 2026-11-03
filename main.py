@@ -137,7 +137,7 @@ class BrowserUsePlugin(Star):
                     ["POST"],
                     "Authenticated host browser control channel.",
                 )
-                for control in ("stop", "close"):
+                for control in ("stop", "close", "viewport"):
                     self.context.register_web_api(
                         f"/browser-use/{control}",
                         self.browser_observation,
@@ -302,7 +302,7 @@ class BrowserUsePlugin(Star):
         lease = self._lease
         token = self._bridge_token
         path = request.path.rsplit("/", 1)[-1]
-        if path not in {"snapshot", "stream", "stop", "close", "manual"}:
+        if path not in {"snapshot", "stream", "stop", "close", "manual", "viewport"}:
             path = "status"
         try:
             if self._bridge_file is None:
@@ -310,15 +310,20 @@ class BrowserUsePlugin(Star):
             bridge = json.loads(self._bridge_file.read_text(encoding="utf-8"))
             generation = request.query.get("generation")
             browser_session_id = request.query.get("browser_session_id")
-            if path in {"snapshot", "stream", "stop", "close", "manual"} and (
-                not generation or not browser_session_id
-            ):
+            if path in {
+                "snapshot",
+                "stream",
+                "stop",
+                "close",
+                "manual",
+                "viewport",
+            } and (not generation or not browser_session_id):
                 return error_response("Browser identity is required.", status_code=400)
             if generation is not None and generation != bridge["generation"]:
                 return error_response("Browser generation expired.", status_code=409)
             private_path = (
                 "identity"
-                if path in {"stop", "close", "manual"}
+                if path in {"stop", "close", "manual", "viewport"}
                 else "snapshot"
                 if path == "snapshot"
                 else "status"
@@ -349,6 +354,47 @@ class BrowserUsePlugin(Star):
                 and browser_session_id != state["browser_session_id"]
             ):
                 return error_response("Browser session expired.", status_code=409)
+            if path == "viewport":
+                if self._operation_lock.locked():
+                    return error_response(
+                        "Viewport update deferred until the Agent action settles.",
+                        status_code=409,
+                    )
+                async with self._operation_lock, self._control_lock:
+                    if (
+                        not self._enabled
+                        or self._owner != owner
+                        or self._lease != lease
+                    ):
+                        return error_response(
+                            "Browser ownership expired.", status_code=409
+                        )
+                    async with aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=10)
+                    ) as client:
+                        async with client.post(
+                            f"http://127.0.0.1:{int(bridge['port'])}/viewport",
+                            headers={"Authorization": f"Bearer {token}"},
+                            json={
+                                "owner": owner,
+                                "generation": generation,
+                                "browser_session_id": browser_session_id,
+                                "tab_id": request.query.get("tab_id"),
+                                "width": int(request.query.get("width", "0")),
+                                "height": int(request.query.get("height", "0")),
+                                "device_scale_factor": float(
+                                    request.query.get("device_scale_factor", "1")
+                                ),
+                            },
+                        ) as response:
+                            if response.status != 200:
+                                return error_response(
+                                    "Viewport update deferred.",
+                                    status_code=response.status,
+                                )
+                            return json_response(
+                                {"status": "ok", "data": await response.json()}
+                            )
             if path in {"stop", "close"}:
                 return await self.browser_control(
                     path, bridge, state, owner, lease, token
@@ -572,7 +618,7 @@ class BrowserUsePlugin(Star):
                         timeout=aiohttp.ClientTimeout(
                             total=None, sock_connect=5, sock_read=5
                         ),
-                        read_bufsize=768 * 1024,
+                        read_bufsize=3 * 1024 * 1024,
                     ) as client:
                         async with client.get(
                             f"http://127.0.0.1:{int(bridge['port'])}/stream",
@@ -589,7 +635,7 @@ class BrowserUsePlugin(Star):
                                 buffer += chunk
                                 while b"\n\n" in buffer:
                                     block, buffer = buffer.split(b"\n\n", 1)
-                                    if len(block) > 768 * 1024:
+                                    if len(block) > 3 * 1024 * 1024:
                                         raise ValueError(
                                             "Browser stream event is too large."
                                         )
@@ -610,7 +656,7 @@ class BrowserUsePlugin(Star):
                                             "Browser stream identity expired."
                                         )
                                     queue.put_nowait(event)
-                                if len(buffer) > 768 * 1024:
+                                if len(buffer) > 3 * 1024 * 1024:
                                     raise ValueError(
                                         "Browser stream event is too large."
                                     )

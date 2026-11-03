@@ -514,7 +514,6 @@ async def test_manual_admission_ordering_target_and_explicit_handback(observed_s
             for patch in (
                 {"client_id": "forged"},
                 {"control_epoch": epoch - 1},
-                {"target": {**click["target"], "document_id": "old"}},
                 {"input_id": 2},
             ):
                 async with http.post(url, json={**click, **patch}) as response:
@@ -846,20 +845,23 @@ async def test_keyboard_order_privacy_and_cleanup(observed_server):
                     "target": {**target, "document_id": "old"},
                 },
             ) as response:
-                assert response.status == 409
+                assert response.status == 200
+                assert (await response.json())["status"] == "stale"
+            assert observer.control_mode == "human"
+            transport.insertText.assert_awaited_once()
             assert not observer._held_keys
             assert (
                 transport.dispatchKeyEvent.await_args.kwargs["params"]["type"]
                 == "keyUp"
             )
-            async with http.post(url, json={**key, "input_id": 3}) as response:
+            async with http.post(url, json={**key, "input_id": 4}) as response:
                 assert response.status == 200
             async with http.post(
-                url, json={**base, "operation": "reset_keys", "input_id": 4}
+                url, json={**base, "operation": "reset_keys", "input_id": 5}
             ) as response:
                 assert response.status == 200
             assert not observer._held_keys
-            async with http.post(url, json={**key, "input_id": 5}) as response:
+            async with http.post(url, json={**key, "input_id": 6}) as response:
                 assert response.status == 200
             async with http.post(
                 url, json={**base, "operation": "disconnect"}
@@ -1195,6 +1197,99 @@ async def test_captured_input_ack_cannot_cross_control_epoch(observed_server):
     assert frame["applied_input_id"] == 9
 
 
+async def test_heartbeat_survives_page_navigation(observed_server):
+    """Renew an authenticated lease even when the page context is unavailable.
+
+    Args:
+        observed_server: Owned browser and isolated observer.
+    """
+    _, observer, _ = observed_server
+    observer.owner = "trusted-chat"
+    observer.human = {"owner": "trusted-chat", "client_id": "socket"}
+    observer.control_mode = "human"
+    observer.control_epoch = 1
+    observer.read_state.side_effect = RuntimeError("Execution context was destroyed")
+    await observer.start()
+    port = json.loads(observer.discovery.read_text())["port"]
+    try:
+        async with aiohttp.ClientSession(
+            headers={"Authorization": "Bearer secret"}
+        ) as http:
+            async with http.post(
+                f"http://127.0.0.1:{port}/manual",
+                json={
+                    "generation": observer.generation,
+                    "browser_session_id": "browser",
+                    "owner": "trusted-chat",
+                    "client_id": "socket",
+                    "control_epoch": 1,
+                    "operation": "heartbeat",
+                },
+            ) as response:
+                assert response.status == 200
+                assert (await response.json())["status"] == "applied"
+        observer.read_state.assert_not_awaited()
+        assert observer.control_mode == "human"
+    finally:
+        await observer.close()
+
+
+async def test_viewport_dimensions_and_ownership(observed_server):
+    """Resize only the owned idle target with bounded sharpness and dimensions.
+
+    Args:
+        observed_server: Owned browser and isolated observer.
+    """
+    server, observer, _ = observed_server
+    observer.owner = "trusted-chat"
+    metrics = AsyncMock()
+    cdp = SimpleNamespace(
+        session_id="cdp",
+        cdp_client=SimpleNamespace(
+            send=SimpleNamespace(
+                Emulation=SimpleNamespace(setDeviceMetricsOverride=metrics)
+            )
+        ),
+    )
+    observer.read_state.return_value = (server.browser_session, cdp, {"tab_id": "tab"})
+    await observer.start()
+    port = json.loads(observer.discovery.read_text())["port"]
+    body = {
+        "generation": observer.generation,
+        "browser_session_id": "browser",
+        "owner": "trusted-chat",
+        "tab_id": "tab",
+        "width": 900,
+        "height": 600,
+        "device_scale_factor": 2,
+    }
+    try:
+        async with aiohttp.ClientSession(
+            headers={"Authorization": "Bearer secret"}
+        ) as http:
+            url = f"http://127.0.0.1:{port}/viewport"
+            for patch in ({"owner": "other"}, {"tab_id": "other"}):
+                async with http.post(url, json={**body, **patch}) as response:
+                    assert response.status == 409
+            async with http.post(url, json={**body, "width": 100000}) as response:
+                assert response.status == 400
+            metrics.assert_not_awaited()
+            async with http.post(url, json=body) as response:
+                assert response.status == 200
+            assert metrics.await_args.kwargs["params"] == {
+                "width": 900,
+                "height": 600,
+                "deviceScaleFactor": 2,
+                "mobile": False,
+            }
+            observer.human = {"client_id": "other-window"}
+            async with http.post(url, json=body) as response:
+                assert response.status == 409
+            assert metrics.await_count == 1
+    finally:
+        await observer.close()
+
+
 async def test_capture_session_preserves_viewport_and_is_bounded(
     observed_server, monkeypatch
 ):
@@ -1229,7 +1324,8 @@ async def test_capture_session_preserves_viewport_and_is_bounded(
         """
         if kwargs["session_id"] == "agent":
             live["position_revision"] += 2
-        assert "clip" not in kwargs["params"]
+        assert kwargs["params"]["clip"]["width"] == live["viewport_width"]
+        assert kwargs["params"]["clip"]["height"] == live["viewport_height"]
         return {"data": base64.b64encode(image.getvalue()).decode()}
 
     async def evaluate(**kwargs):
@@ -1280,7 +1376,7 @@ async def test_capture_session_preserves_viewport_and_is_bounded(
     live.update(viewport_width=960, viewport_height=600, position_revision=3)
     frame = await observer.capture_snapshot(browser, cdp, {**live, "tab_id": "tab"})
     assert frame["viewport_width"] == 960
-    assert "clip" not in shot.await_args.kwargs["params"]
+    assert shot.await_args.kwargs["params"]["clip"]["scale"] == 2
     assert attach.await_count == 1 and clients[2].stop.await_count == 0
     browser.agent_focus_target_id = "next"
     await observer.capture_snapshot(browser, cdp, {**live, "tab_id": "next"})
