@@ -25,20 +25,23 @@ from observer import BrowserObserver
         {"viewport_height": 600},
     ],
 )
+@pytest.mark.parametrize("execution_state", ["active", "stopped"])
 async def test_delayed_cdp_frame_is_acknowledged_but_not_published(
-    monkeypatch, tmp_path, change
+    monkeypatch, tmp_path, change, execution_state
 ):
-    """Reject an old target's frame while keeping its CDP acknowledgement alive.
+    """Keep live and idle frames on one high-resolution capture path.
 
     Args:
         monkeypatch: Isolated bridge credentials.
         tmp_path: Disposable discovery directory.
         change: Coordinate-space change after the first accepted frame.
+        execution_state: Observation continues after Agent execution stops.
     """
     monkeypatch.setenv("ASTRBOT_BROWSER_BRIDGE_TOKEN", "secret")
     monkeypatch.setenv("ASTRBOT_BROWSER_BRIDGE_FILE", str(tmp_path / "bridge.json"))
     browser = SimpleNamespace(id="browser", agent_focus_target_id="current")
     observer = BrowserObserver(SimpleNamespace(browser_session=browser))
+    observer.execution_state = execution_state
     callbacks = []
     started = asyncio.Event()
     acked = asyncio.Event()
@@ -69,6 +72,19 @@ async def test_delayed_cdp_frame_is_acknowledged_but_not_published(
         "scroll_y": 0,
     }
     observer.read_state = AsyncMock(return_value=(browser, cdp, state))
+    image = io.BytesIO()
+    Image.new("RGB", (1920, 1080)).save(image, format="JPEG")
+    high_resolution = base64.b64encode(image.getvalue()).decode()
+    observer.capture_snapshot = AsyncMock(
+        side_effect=lambda browser, cdp, state: {
+            **state,
+            "image": high_resolution,
+            "mime_type": "image/jpeg",
+            "width": 1920,
+            "height": 1080,
+            "capture_timestamp": time.time(),
+        }
+    )
     queue = ObservationQueue()
     observer.subscribers.add(queue)
     capture = asyncio.create_task(observer.capture())
@@ -99,10 +115,13 @@ async def test_delayed_cdp_frame_is_acknowledged_but_not_published(
         callbacks[0](event, "current-session")
         frame = await asyncio.wait_for(queue.get(), 2)
         assert frame["type"] == "frame" and frame["tab_id"] == "current"
+        assert frame["image"] == high_resolution
+        assert (frame["width"], frame["height"]) == (1920, 1080)
         assert ack.await_count == 2
         # Sampling new metadata cannot relabel a delayed old-space CDP image.
         state.update(change)
         event.update(sessionId=12)
+        event["metadata"]["timestamp"] = time.time()
         callbacks[0](event, "current-session")
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(queue.get(), 0.3)
@@ -119,10 +138,26 @@ async def test_delayed_cdp_frame_is_acknowledged_but_not_published(
             image, format="JPEG"
         )
         event.update(sessionId=13, data=base64.b64encode(image.getvalue()).decode())
+        event["metadata"]["timestamp"] = time.time()
         callbacks[0](event, "current-session")
         matched = await asyncio.wait_for(queue.get(), 2)
         assert matched["type"] == "frame"
         assert all(matched[key] == value for key, value in change.items())
+        assert matched["image"] == high_resolution
+        # Screenshot-induced duplicate casts cannot create a capture feedback loop.
+        capture_count = observer.capture_snapshot.await_count
+        event.update(sessionId=14)
+        event["metadata"]["timestamp"] = time.time()
+        callbacks[0](event, "current-session")
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(queue.get(), 0.3)
+        assert observer.capture_snapshot.await_count == capture_count
+        # Static-page fallback must use the same rasterization as live updates.
+        idle = await asyncio.wait_for(queue.get(), 2)
+        assert idle["type"] == "frame"
+        assert idle["image"] == matched["image"]
+        assert (idle["width"], idle["height"]) == (matched["width"], matched["height"])
+        assert idle["execution_state"] == execution_state
     finally:
         capture.cancel()
         with contextlib.suppress(asyncio.CancelledError):

@@ -1279,7 +1279,7 @@ async def test_viewport_dimensions_and_ownership(observed_server):
             assert metrics.await_args.kwargs["params"] == {
                 "width": 900,
                 "height": 600,
-                "deviceScaleFactor": 2,
+                "deviceScaleFactor": 1.8,
                 "mobile": False,
             }
             observer.human = {"client_id": "other-window"}
@@ -1373,10 +1373,11 @@ async def test_capture_session_preserves_viewport_and_is_bounded(
     clients[1].stop.assert_awaited_once()
     frame = await observer.capture_snapshot(browser, cdp, {**live, "tab_id": "tab"})
     assert frame["position_revision"] == 0
+    assert shot.await_args.kwargs["params"]["clip"]["scale"] == 1.5
     live.update(viewport_width=960, viewport_height=600, position_revision=3)
     frame = await observer.capture_snapshot(browser, cdp, {**live, "tab_id": "tab"})
     assert frame["viewport_width"] == 960
-    assert shot.await_args.kwargs["params"]["clip"]["scale"] == 2
+    assert shot.await_args.kwargs["params"]["clip"]["scale"] == 1.8
     assert attach.await_count == 1 and clients[2].stop.await_count == 0
     browser.agent_focus_target_id = "next"
     await observer.capture_snapshot(browser, cdp, {**live, "tab_id": "next"})

@@ -120,7 +120,7 @@ Dashboard 扩展接口（沿用 AstrBot 登录鉴权）：
 
 状态/快照成功返回 `{status: "ok", data: ...}`。`data` 包括 `generation`（每次 MCP 进程启动的新代次）、`browser_session_id`（实际 BrowserSession ID）、`tab_id`（当前 CDP target）、`sequence`、`timestamp`（UTC ISO 8601）、`available`、`url`、`title`、`width` 和 `height`。快照另外包含 `image`（base64 JPEG）、`mime_type`。状态查询的尺寸为 0，当前标签不存在时 `tab_id` 为 null。
 
-流返回 `text/event-stream`，每块为 `id: <sequence>\ndata: <JSON>\n\n`。JSON 直接携带上述完整身份/页面字段及 `type: "state" | "frame" | "action"`，没有状态响应 envelope。`frame` 另带 `image`、`mime_type: "image/jpeg"` 和 `capture_timestamp`（CDP 帧采集的 Unix 秒数）；尺寸是编码图像的实际尺寸。无变化时只发心跳 `: hb\n\n`。`sequence` 在同一代次内统一计数快照和流事件，状态查询只读取最近序号；丢帧、快照和多个订阅者都可能造成序号跳跃，不保证连续。客户端只接收匹配代次/浏览器会话且序号更新的事件；每帧自带标签身份，因此丢失中间状态也可正确跟随。更换标签或 URL 的状态先清空旧图像，旧 CDP session 的帧仍尝试确认，但不发布。
+流返回 `text/event-stream`，每块为 `id: <sequence>\ndata: <JSON>\n\n`。JSON 直接携带上述完整身份/页面字段及 `type: "state" | "frame" | "action"`，没有状态响应 envelope。`frame` 另带 `image`、`mime_type: "image/jpeg"` 和 `capture_timestamp`（截图开始采集的 Unix 秒数）；尺寸是编码图像的实际尺寸。没有待发事件时发送心跳 `: hb\n\n`，静止页面仍保留约一秒一次的一致性补帧。`sequence` 在同一代次内统一计数快照和流事件，状态查询只读取最近序号；丢帧、快照和多个订阅者都可能造成序号跳跃，不保证连续。客户端只接收匹配代次/浏览器会话且序号更新的事件；每帧自带标签身份，因此丢失中间状态也可正确跟随。更换标签或 URL 时立即作废旧图像的输入坐标，配套的新 Dashboard 保留上一帧显示至新截图到达。旧 CDP session 的帧仍尝试确认，但不触发新截图。
 
 动作和状态/画面使用同一代次内的 `sequence`。`type: "action"` 表示动作快照变化；所有状态、快照、帧和动作事件均包含 `current_action`（执行中或 null）、`recent_actions`（当前浏览器最多 32 个终态动作）、`action_cursor`（最近动作事件序号）和 `highlight`（有效操作标记或 null）。动作记录包含 `action_id`、可信 `invocation_id`、`generation`、`browser_session_id`、开始时的 `tab_id`、`kind`、`status`、`started_at` 和终态的 `finished_at`（Unix 秒）。`kind` 为 `navigate|click|type|scroll|tab|close|inspect`，`status` 为 `running|succeeded|failed|timed_out|cancelled`。显示摘要由这些枚举翻译产生，不复制工具参数、输入或结果。输入工具本身也使用敏感输入标记，避免上游日志和工具返回重复明文。
 
@@ -128,11 +128,11 @@ Dashboard 扩展接口（沿用 AstrBot 登录鉴权）：
 
 页面额外包含 `document_id`（当前文档的 performance.timeOrigin）、`viewport_width/viewport_height` 和 `scroll_x/scroll_y`。点击/输入完成后，从该次实际执行的上游事件结果提取坐标，不读取或刷新 DOM 索引；若执行没有可靠坐标，只显示摘要。`highlight` 包含这些页面身份、`action_id`、`x/y` 和 `expires_at`，最长显示两秒，按图片对应的视口比例绘制。导航（包括相同 URL 重载）、切页、滚动、视口变化、下一动作和到期都会清除旧标记。取消表示停止等待及后续执行，不撤销已发生的网页操作。
 
-动作状态先报告新的滚动位置或视口时，侧栏清空旧画面，等待坐标空间匹配的新帧后再显示标记。私有采集将 CDP 帧自带的 `scrollOffsetX/Y`、`deviceWidth/Height` 与页面采样核对，仅发布相符且 `pageScaleFactor=1`、`offsetTop=0` 的帧；缺少、无效或不匹配的元数据会保守丢帧，仍确认该 CDP 帧，不用较新的页面采样覆盖旧像素的坐标空间。事件结构、统一序号、图像上限与恢复游标保持原契约。
+动作状态先报告新的滚动位置或视口时，侧栏作废旧画面的输入坐标，等待坐标空间匹配的新帧后再显示标记。私有采集将 CDP 通知自带的 `scrollOffsetX/Y`、`deviceWidth/Height` 与页面采样核对，仅相符且 `pageScaleFactor=1`、`offsetTop=0` 的通知触发即时截图；缺少、无效或不匹配的元数据仍确认，但由一致性补帧获取当前页面。最终图片统一由 `Page.captureScreenshot` 产生，并在截图后核对文档、视口和滚动位置，不用较新的页面采样覆盖旧像素的坐标空间。事件结构、统一序号、图像上限与恢复游标保持原契约。
 
-私有桥只绑定 `127.0.0.1` 的随机端口，使用本次启用的随机 Bearer 凭据和运行代次校验；发现文件仅存放端口和代次。公共响应不包含 CDP 地址或桥接凭据。快照通过 `Page.captureScreenshot` 读取当前视口（1280×720、JPEG quality 65），不调用 DOM 状态刷新或修改 Agent 焦点。标签变化时丢弃该次结果并要求刷新。插件退出时关闭桥并移除其发现文件。
+私有桥只绑定 `127.0.0.1` 的随机端口，使用本次启用的随机 Bearer 凭据和运行代次校验；发现文件仅存放端口和代次。公共响应不包含 CDP 地址或桥接凭据。快照通过 `Page.captureScreenshot` 读取当前实际视口，最多 2 倍采样、JPEG quality 90、最大 1920×1080，不调用 DOM 状态刷新或修改 Agent 焦点。标签变化时丢弃该次结果并要求刷新。插件退出时关闭桥并移除其发现文件。
 
-只读观测通过同一 BrowserSession 的 `Page.startScreencast` 取帧，JPEG quality 65、最大 1280×720、压缩图片最多 512 KiB、单事件最多 768 KiB；元数据拒绝超过 8192 字符的 URL 或 1024 字符的标题。只读发布间隔至少 250 ms（最多约 4 Hz，静止页面不强制产生新帧）。采集不调用 `browser_get_state` 或其他 MCP 工具，不刷新 DOM 状态或改变焦点。每个代次最多 4 个订阅，每个订阅在私有桥和宿主代理各保留一个待发画面，并为动作保留独立有界缓冲，慢客户端覆盖旧画面；CDP 确认独立执行并有界。私有桥写入超过 2 秒就关闭该订阅。人工接管使用下述专用鉴权通道，人工期间以 100 ms 采集间隔（目标上限约 10 Hz）复用一致性截图反馈，只读间隔仍为 250 ms（最多约 4 Hz）。
+只读观测通过同一 BrowserSession 的 `Page.startScreencast` 检测画面变化，不直接发布其原始图片；变化通知、静止补帧和人工操作反馈统一使用上述高清截图路径，避免不同采样比例交替。重复的相同像素和坐标通知不触发额外截图，静止页面约一秒补帧一次；停止 Agent 执行后仍保留观测。压缩图片最多 2 MiB、单事件最多 3 MiB；元数据拒绝超过 8192 字符的 URL 或 1024 字符的标题。只读采集间隔至少 250 ms（最多约 4 Hz）。采集不调用 `browser_get_state` 或其他 MCP 工具，不刷新 DOM 状态或改变焦点。每个代次最多 4 个订阅，每个订阅在私有桥和宿主代理各保留一个待发画面，并为动作保留独立有界缓冲，慢客户端覆盖旧画面；CDP 确认独立执行并有界。私有桥写入超过 2 秒就关闭该订阅。人工接管使用下述专用鉴权通道，人工期间以 100 ms 采集间隔（目标上限约 10 Hz）复用一致性截图反馈。
 
 ## 验证
 
@@ -236,6 +236,6 @@ python scripts/browser_manual_control_acceptance.py --plugin-zip D:/delivery/ast
 
 配套的新 Dashboard 会同步侧栏／全屏的可用尺寸。只读调整经宿主校验聊天归属；Agent 动作执行期间延后，人工控制期间仅控制窗口通过原输入通道调整。新能力标记为 `viewport_resize_version: 1`，旧前端仍可观看。
 
-快照按实际视口最多 2 倍采样，JPEG 质量 90，上限 2560×1600。图片最多 2 MiB、事件最多 3 MiB，复杂图片按需降质，待发帧缓冲仍只保留最新图片。需要更新宿主后端、Dashboard 与插件源码；已有 dist 离线包不会随源码自动更新。
+快照按实际视口最多 2 倍采样，JPEG 质量 90，上限 1920×1080。图片最多 2 MiB、事件最多 3 MiB，复杂图片按需降质，待发帧缓冲仍只保留最新图片。需要更新宿主后端、Dashboard 与插件源码；已有 dist 离线包不会随源码自动更新。
 
 过期且未执行的点击／键盘输入返回 `stale`，保留人工控制、丢弃未发送输入并等待新画面，不重放操作。心跳续租不再访问网页执行上下文；真实断连、撤权、未知执行结果仍暂停控制。

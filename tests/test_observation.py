@@ -468,7 +468,7 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
         assert frame_response.status_code == 200
         frame = json.loads(frame_response.body)["data"]
         assert frame["tab_id"] == state["tab_id"]
-        assert frame["width"] == 2560 and frame["height"] == 1440
+        assert frame["width"] == 1920 and frame["height"] == 1080
         assert len(base64.b64decode(frame["image"])) > 100
         # Reuse the original DOM index before any subsequent DOM refresh.
         await tool("browser_type", index=index, text="中文观测验证二")
@@ -511,7 +511,7 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                 if event["type"] == "frame" and (
                     tab_id is None or event["tab_id"] == tab_id
                 ):
-                    assert 0 < event["width"] <= 2560 and 0 < event["height"] <= 1600
+                    assert 0 < event["width"] <= 1920 and 0 < event["height"] <= 1080
                     assert len(base64.b64decode(event["image"])) <= 512 * 1024
                     event["delivery_latency"] = max(
                         time.time() - event["capture_timestamp"], 0
@@ -730,7 +730,7 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                         await ui.locator(".sp-ghost-btn").click()
                         try:
                             await ui.wait_for_function(
-                                "document.querySelector('.agent-browser-image img')?.naturalWidth === 2560",
+                                "document.querySelector('.agent-browser-image img')?.naturalWidth === 1920",
                                 timeout=15000,
                             )
                         except Exception as exc:
@@ -826,7 +826,7 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                         await tool("browser_scroll", direction="down")
                         await ui.evaluate("window.observerProbe.setVisible(true)")
                         await ui.wait_for_function(
-                            "document.querySelector('.agent-browser-image img')?.naturalWidth === 2560"
+                            "document.querySelector('.agent-browser-image img')?.naturalWidth === 1920"
                         )
                         await tool("browser_scroll", direction="up")
                         await ui.wait_for_function(
@@ -857,7 +857,7 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                             await ui.goto(url + "?locale=en-US")
                             await ui.locator(".sp-ghost-btn").click()
                             await ui.wait_for_function(
-                                "document.querySelector('.agent-browser-image img')?.naturalWidth === 2560"
+                                "document.querySelector('.agent-browser-image img')?.naturalWidth === 1920"
                             )
                             await ui.wait_for_function(
                                 "document.querySelector('.agent-browser-status')?.textContent.includes('Live')"
@@ -897,7 +897,7 @@ async def test_live_browser_observation(plugin_class, tmp_path, monkeypatch):
                         assert target and target["scroll_y"] == moved["scroll_y"]
                         assert 0 <= target["y"] < moved["viewport_height"]
                         await ui.wait_for_function(
-                            "(id) => document.querySelector('.agent-browser-target') && document.querySelector('.agent-browser-actions li')?.dataset.actionId === id && document.querySelector('.agent-browser-image img')?.naturalWidth === 2560",
+                            "(id) => document.querySelector('.agent-browser-target') && document.querySelector('.agent-browser-actions li')?.dataset.actionId === id && document.querySelector('.agent-browser-image img')?.naturalWidth === 1920",
                             arg=target["action_id"],
                             timeout=5000,
                         )

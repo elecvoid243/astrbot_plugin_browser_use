@@ -23,8 +23,8 @@ from observation_queue import ACTION_LIMIT, ObservationQueue
 
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_EVENT_BYTES = 3 * 1024 * 1024
-MAX_FRAME_WIDTH = 2560
-MAX_FRAME_HEIGHT = 1600
+MAX_FRAME_WIDTH = 1920
+MAX_FRAME_HEIGHT = 1080
 FRAME_INTERVAL = 0.25
 HUMAN_FRAME_INTERVAL = 0.1
 # A scroll revision also covers nested scrollers without treating animation frames
@@ -1330,6 +1330,7 @@ class BrowserObserver:
         active = None
         pending = None
         metadata = None
+        last_screencast = None
         not_before = 0.0
         acknowledgements = asyncio.Queue(maxsize=8)
         ack_task = asyncio.create_task(self.acknowledge(acknowledgements))
@@ -1394,6 +1395,7 @@ class BrowserObserver:
                             )
                         active = None
                         pending = None
+                        last_screencast = None
                         overflow = False
                         self.publish("state", state)
                         if cdp is not None:
@@ -1447,8 +1449,31 @@ class BrowserObserver:
                             (frame_metadata.get("offsetTop"), 0),
                         )
                     )
+                    if event is not None and coordinates_match:
+                        visual = (
+                            event["data"],
+                            *(
+                                frame_metadata.get(key)
+                                for key in (
+                                    "deviceWidth",
+                                    "deviceHeight",
+                                    "scrollOffsetX",
+                                    "scrollOffsetY",
+                                    "pageScaleFactor",
+                                    "offsetTop",
+                                )
+                            ),
+                        )
+                        # Capturing a screenshot can emit an unchanged cast.
+                        # Repeated pixels are not a new visual change; the idle
+                        # fallback and human input feedback still capture below.
+                        if visual == last_screencast:
+                            event = None
+                        else:
+                            last_screencast = visual
                     if cdp is not None and (
                         self.control_mode == "human"
+                        or (event is not None and coordinates_match)
                         or (
                             event is not None
                             and not coordinates_match
@@ -1456,37 +1481,15 @@ class BrowserObserver:
                         )
                         or (event is None and time.monotonic() - last_frame >= 1)
                     ):
-                        # Static pages can stop emitting screencast frames after
-                        # asynchronous input effects. Reuse validated snapshots
-                        # while a human is interacting, at the same bounded rate.
+                        # Screencast only signals changes: its native-resolution
+                        # pixels differ from scaled screenshots. Use one capture
+                        # path for live, idle and human-control frames so text and
+                        # geometry cannot alternate between rasterization scales.
                         frame = await asyncio.wait_for(
                             self.capture_snapshot(browser, cdp, state), 3
                         )
                         self.publish("frame", frame)
                         last_frame = time.monotonic()
-                    elif event is not None and cdp is not None and coordinates_match:
-                        raw = base64.b64decode(event["data"], validate=True)
-                        with Image.open(io.BytesIO(raw)) as picture:
-                            width, height = picture.size
-                        if (
-                            len(raw) <= MAX_IMAGE_BYTES
-                            and 0 < width <= MAX_FRAME_WIDTH
-                            and 0 < height <= MAX_FRAME_HEIGHT
-                            and self.server.browser_session is browser
-                            and browser.agent_focus_target_id == target
-                        ):
-                            self.publish(
-                                "frame",
-                                {
-                                    **state,
-                                    "width": width,
-                                    "height": height,
-                                    "image": event["data"],
-                                    "mime_type": "image/jpeg",
-                                    "capture_timestamp": event["metadata"]["timestamp"],
-                                },
-                            )
-                            last_frame = time.monotonic()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
