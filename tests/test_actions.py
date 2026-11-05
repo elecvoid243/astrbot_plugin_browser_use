@@ -1394,12 +1394,16 @@ async def test_capture_session_preserves_viewport_and_is_bounded(
 @pytest.mark.parametrize(
     "ending", ["up", "cancel", "disconnect", "navigation", "uncertain"]
 )
-async def test_held_drag_ordering_scroll_and_cleanup(observed_server, ending):
+@pytest.mark.parametrize("click_count", [1, 2])
+async def test_held_drag_ordering_scroll_and_cleanup(
+    observed_server, ending, click_count
+):
     """Keep a drag bound to its page and release it on every exit.
 
     Args:
         observed_server: Isolated HTTP runtime with controlled CDP dispatch.
         ending: Gesture termination or failure to exercise.
+        click_count: Native single or double press count.
     """
     server, observer, _ = observed_server
     dispatch = AsyncMock()
@@ -1445,14 +1449,23 @@ async def test_held_drag_ordering_scroll_and_cleanup(observed_server, ending):
                 "operation": "pointer",
                 "input_id": 1,
                 "phase": "down",
+                "click_count": click_count,
                 "x": 100,
                 "y": 80,
                 "target": dict(state),
             }
+            for invalid_count in (0, 3, True):
+                async with http.post(
+                    url, json={**command, "click_count": invalid_count}
+                ) as response:
+                    assert response.status == 400
+                assert observer._held_mouse is None
+                dispatch.assert_not_awaited()
             for _ in range(2):
                 async with http.post(url, json=command) as response:
                     assert (await response.json())["status"] == "applied"
             assert dispatch.await_count == 1
+            assert dispatch.await_args.kwargs["params"]["clickCount"] == click_count
             assert observer._held_mouse is not None
             state.update(scroll_y=100, position_revision=1)
             async with http.post(
@@ -1465,7 +1478,7 @@ async def test_held_drag_ordering_scroll_and_cleanup(observed_server, ending):
                 "y": 80,
                 "button": "left",
                 "buttons": 1,
-                "clickCount": 1,
+                "clickCount": click_count,
             }
             if ending == "navigation":
                 state["document_id"] = "another-page"
@@ -1496,6 +1509,7 @@ async def test_held_drag_ordering_scroll_and_cleanup(observed_server, ending):
                 assert dispatch.await_args.kwargs["params"]["x"] == -1
             else:
                 assert dispatch.await_args.kwargs["params"]["x"] == 300
+                assert dispatch.await_args.kwargs["params"]["clickCount"] == click_count
             if ending in {"disconnect", "uncertain"}:
                 assert observer.control_mode == "paused"
     finally:

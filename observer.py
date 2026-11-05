@@ -568,7 +568,7 @@ class BrowserObserver:
                             raise web.HTTPBadRequest(
                                 text="Invalid pointer coordinates."
                             )
-                        if operation == "click" and (
+                        if operation in {"click", "pointer"} and (
                             type(body.get("click_count", 1)) is not int
                             or body.get("click_count", 1) not in (1, 2)
                         ):
@@ -683,7 +683,7 @@ class BrowserObserver:
                                             "y": y,
                                             "button": "left",
                                             "buttons": 0 if phase == "up" else 1,
-                                            "clickCount": 1,
+                                            "clickCount": body.get("click_count", 1),
                                         },
                                         session_id=cdp.session_id,
                                     ),
