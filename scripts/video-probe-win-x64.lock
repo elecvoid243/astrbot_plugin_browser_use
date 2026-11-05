@@ -1,0 +1,16 @@
+# Disposable V01 overlay for the existing Python 3.13 Windows x64 runtime.
+# Base Browser Use dependencies remain pinned by requirements-win-x64.lock.
+aioice==0.12.1 --hash=sha256:91b195bd4fd6b7f475f8f99d750153c2e4cf063ac819813c4a3aaceaf76154c5
+aiortc==1.14.0 --hash=sha256:4b244d7e482f4e1f67e685b3468269628eca1ec91fa5b329ab517738cfca086e
+av==16.0.1 --hash=sha256:708a66c248848029bf518f0482b81c5803846f1b597ef8013b19c014470b620f
+cffi==2.1.1 --hash=sha256:1aa5645c30469b09530c4ebca77ebf8f17618293c58f8549cb1a543a50236e7d
+cryptography==50.0.2 --hash=sha256:7afa5a6602a9f29af1f3a2965f831bae7c9d5d597b7cbb716d41ab3b7d89879c
+dnspython==2.9.2 --hash=sha256:af15f7d385a6ae2fb35a796fde2138004c8c42c7389090e2addc83e3b3340fd8
+google-crc32c==1.9.0 --hash=sha256:8583ec21d56b565d68ab2963cc7e21b3b271247c29b04286068255ef65f221bd
+ifaddr==0.2.0 --hash=sha256:085e0305cfe6f16ab12d72e2024030f5d52674afad6911bb1eee207177b8a748
+psutil==7.2.2 --hash=sha256:eb7e81434c8d223ec4a219b5fc1c47d0417b12be7ea866e24fb5ad6e84b3d988
+pycparser==3.12 --hash=sha256:a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e
+pyee==16.0.1 --hash=sha256:756e8d455970f8c5598e760495ec9195c6d31a64beb3f3f666662fc169804076
+pylibsrtp==1.0.0 --hash=sha256:8d6527c4a78a39a8d397f8862a8b7cdad4701ee866faf9de4ab8c70be61fd34d
+pyopenssl==26.4.0 --hash=sha256:f0eb0cb2d581d3ad2b9c489468485e7f2ab6727d08401bcf9d824c3caddf3c1c
+typing-extensions==4.15.0 --hash=sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548

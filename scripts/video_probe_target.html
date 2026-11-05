@@ -1,0 +1,18 @@
+<!doctype html><meta charset="utf-8"><title>Local browser video probe</title>
+<style>
+body{margin:0;font:14px system-ui;background:#f8fafc;color:#172554}header{position:fixed;inset:0 0 auto;background:#fff;padding:55px 24px 12px;z-index:2;border-bottom:1px solid #999}#stamp{position:fixed;left:0;top:0;z-index:5;image-rendering:pixelated}input{width:600px}#drag{position:absolute;left:40px;top:310px;width:150px;height:70px;background:#38bdf8;cursor:grab;padding:10px}main{padding:420px 24px 24px}.line{height:44px;border-bottom:1px solid #cbd5e1}.anim{position:fixed;top:235px;left:0;width:100px;height:45px;background:#f97316;z-index:3;animation:move 2s linear infinite alternate}@keyframes move{to{transform:translateX(1000px)}}#status{font-size:20px} .small{font:12px monospace}
+</style>
+<canvas id="stamp" width="576" height="40"></canvas>
+<header><h2>Private Chromium: text, scrolling, drag and animation</h2><p class="small">12px: Il1 O0 rn m | 0123456789 | ABCDEFGHIJKLMNOPQRSTUVWXYZ | 中文静态小字</p><input id="slider" type="range" value="10"><span id="value">10</span><div id="status">Ready</div></header><div class="anim"></div><div id="drag">Drag this component</div><main id="content"></main>
+<script>
+const q=new URLSearchParams(location.search),origin=+q.get('origin');
+content.innerHTML=Array.from({length:120},(_,i)=>`<div class="line">Line ${i}: readable long-page content — static text, 0123456789 ABC xyz</div>`).join('');
+window.probe={pending:0,last:0,changed:0,events:[],frames:0};
+const ctx=stamp.getContext('2d');
+function word(value,row){for(let bit=0;bit<32;bit++){ctx.fillStyle=(value>>>bit)&1?'#fff':'#000';ctx.fillRect(bit*18,row*10,18,10)}}
+function mark(e){probe.last=probe.pending;probe.changed=Math.round(performance.timeOrigin+performance.now()-origin);probe.events.push({id:probe.last,t:probe.changed,type:e.type,x:e.clientX,y:e.clientY,scroll:scrollY});document.getElementById('status').textContent=`${e.type} input ${probe.last}, scroll ${scrollY}`}
+for(const type of ['pointerdown','pointermove','pointerup','wheel'])addEventListener(type,e=>{if(type!=='pointermove'||e.buttons)mark(e)},{capture:true,passive:true});
+slider.oninput=()=>value.textContent=slider.value;
+let held=null;drag.onpointerdown=e=>{held={x:e.clientX-drag.offsetLeft,y:e.clientY-drag.offsetTop};drag.setPointerCapture(e.pointerId);e.preventDefault()};drag.onpointermove=e=>{if(held&&e.buttons){drag.style.left=(e.clientX-held.x)+'px';drag.style.top=(e.clientY-held.y)+'px'}};drag.onpointerup=()=>held=null;
+function frame(){word(Math.round(performance.timeOrigin+performance.now()-origin),0);word(probe.last,1);word(probe.changed,2);word(++probe.frames,3);requestAnimationFrame(frame)}frame();
+</script>
