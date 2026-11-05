@@ -54,6 +54,8 @@ async def main():
     parser.add_argument("--bitrate", type=int, default=4000000)
     parser.add_argument("--every-nth-frame", type=int, default=1)
     parser.add_argument("--fps", type=float, default=30)
+    parser.add_argument("--start-gate", type=Path)
+    parser.add_argument("--fault-mode", choices=["pre-ready", "post-ready"])
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     vpx.DEFAULT_BITRATE = args.bitrate
@@ -82,7 +84,7 @@ async def main():
         "bitrate": args.bitrate,
         "every_nth_frame": args.every_nth_frame,
         "fps_limit": args.fps,
-        "probe_version": "v01-identity-preserving-1",
+        "probe_version": "v01-interframes-rendered-state-2",
     }
     browser = BrowserSession(
         executable_path=args.chromium,
@@ -102,6 +104,7 @@ async def main():
     sent_meta = deque()
     client = None
     capture_session = None
+    video_sender = None
     baseline_capture = observer.capture_snapshot
 
     async def measured_capture(*params):
@@ -149,12 +152,17 @@ async def main():
             The unchanged packet payloads and timestamp.
         """
         before = time.monotonic()
+        picture_type = int(frame.pict_type)
         result = original_encode(encoder, frame, force_keyframe)
         record = {
             "t": time.monotonic() - start,
             "pts": frame.pts,
             "ms": (time.monotonic() - before) * 1000,
             "bytes": sum(map(len, result[0])),
+            "input_picture_type": picture_type,
+            "force_keyframe": force_keyframe,
+            "keyframe": bool(result[0])
+            and not (vpx.VpxPayloadDescriptor.parse(result[0][0])[1][0] & 1),
         }
         metrics["encode"].append(record)
         if result[0]:
@@ -220,7 +228,12 @@ async def main():
                     io.BytesIO(base64.b64decode(event["data"])), format="mjpeg"
                 )
                 try:
-                    return next(container.decode(video=0))
+                    frame = next(container.decode(video=0))
+                    # JPEG is intra-only. Do not force every independent decoded
+                    # source image to become an intra frame in the video encoder.
+                    # aiortc can still set I when RTCP requests a recovery frame.
+                    frame.pict_type = av.video.frame.PictureType.NONE
+                    return frame
                 finally:
                     container.close()
 
@@ -411,7 +424,7 @@ async def main():
         Raises:
             HTTPConflict: This V01 fixture already has a viewer.
         """
-        nonlocal client, capture_session
+        nonlocal client, capture_session, video_sender
         await authorize(request)
         if peers:
             raise web.HTTPConflict(text="V01 supports one viewer.")
@@ -419,6 +432,7 @@ async def main():
         peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         peers.append(peer)
         sender = peer.addTrack(CastTrack())
+        video_sender = sender
         transceiver = peer.getTransceivers()[0]
         transceiver.setCodecPreferences(
             [
@@ -603,6 +617,34 @@ async def main():
         stopped.set()
         return web.json_response({"stopped": True})
 
+    async def recovery(request):
+        """Exercise the encoder request used by aiortc's RTCP PLI handler.
+
+        Args:
+            request: Authenticated recovery probe request.
+
+        Returns:
+            Recovery request acknowledgement; not an injected receiver RTCP PLI.
+        """
+        await authorize(request)
+        video_sender._send_keyframe()
+        metrics.setdefault("recovery_requests", []).append(time.monotonic() - start)
+        return web.json_response({"requested": True})
+
+    async def fault(request):
+        """Abruptly exit this disposable runtime for ownership cleanup testing.
+
+        Args:
+            request: Authenticated injected fault request.
+        """
+        await authorize(request)
+        if args.fault_mode != "post-ready":
+            raise web.HTTPForbidden()
+        (args.out / "fault-fired.json").write_text(
+            json.dumps({"phase": "post-ready", "pid": os.getpid()})
+        )
+        os._exit(87)
+
     app = web.Application()
     app.router.add_get("/target", target)
     app.router.add_get("/viewer", viewer)
@@ -612,14 +654,27 @@ async def main():
     app.router.add_get("/inspect", inspect)
     app.router.add_get("/reference", reference)
     app.router.add_post("/shutdown", shutdown)
+    app.router.add_post("/recovery", recovery)
+    app.router.add_post("/fault", fault)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
     await site.start()
     port = site._server.sockets[0].getsockname()[1]
     try:
+        if args.start_gate:
+            deadline = time.monotonic() + 10
+            while not args.start_gate.exists():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("The probe startup ownership gate expired.")
+                await asyncio.sleep(0.01)
         await browser.start()
         await browser.navigate_to(f"http://127.0.0.1:{port}/target?origin={origin}")
+        if args.fault_mode == "pre-ready":
+            (args.out / "fault-fired.json").write_text(
+                json.dumps({"phase": "pre-ready", "pid": os.getpid()})
+            )
+            await asyncio.Event().wait()
         await observer.start()
         tasks.append(asyncio.create_task(resources()))
         (args.out / "ready.json").write_text(
