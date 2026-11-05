@@ -3,6 +3,7 @@
 <canvas id="stamp" width="576" height="90"></canvas><h1>Document __DOC__</h1><div id="nested"><div id="content">Nested scroller in document __DOC__</div></div><button id="button">Count clicks</button><div id="long"></div>
 <script>
 window.identityProbe={document:__DOC__,frames:0,clicks:0};
+identityProbe.inputs=[];for(const type of ['pointerdown','pointerup'])addEventListener(type,e=>identityProbe.inputs.push({type,x:e.clientX,y:e.clientY,target:e.target.id}),true);
 button.onclick=()=>identityProbe.clicks++;
 const ctx=stamp.getContext('2d');
 function draw(){const values=[0x41535452,identityProbe.document,innerWidth,innerHeight,Math.round(scrollY),Math.round(nested.scrollTop),window[Symbol.for('astrbot.browser.position')]?.revision||0,++identityProbe.frames,Math.round(performance.now())];for(let row=0;row<values.length;row++)for(let bit=0;bit<32;bit++){ctx.fillStyle=(values[row]>>>bit)&1?'#fff':'#000';ctx.fillRect(bit*18,row*10,18,10)}requestAnimationFrame(draw)}draw();

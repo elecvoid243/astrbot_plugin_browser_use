@@ -24,6 +24,7 @@ from browser_use.browser.events import SwitchTabEvent
 from PIL import Image
 from video_capture_barrier_candidate import CaptureBarrierCandidate
 
+from frame_coordinates import FrameCoordinates
 from observer import BrowserObserver
 
 
@@ -65,6 +66,7 @@ async def main():
     parser.add_argument("--start-gate", type=Path)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--skip-transition-wait", action="store_true")
+    parser.add_argument("--frame-contract", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     os.environ["ANONYMIZED_TELEMETRY"] = "false"
@@ -77,9 +79,16 @@ async def main():
         user_data_dir=args.out / "profile",
         enable_default_extensions=False,
         viewport={"width": 1280, "height": 720},
-        args=["--no-proxy-server", "--disable-background-networking"],
+        args=[
+            "--no-proxy-server",
+            "--disable-background-networking",
+            *(["--site-per-process"] if args.frame_contract else []),
+        ],
     )
-    observer = BrowserObserver(SimpleNamespace(browser_session=browser))
+    coordinates = FrameCoordinates(browser) if args.frame_contract else None
+    observer = BrowserObserver(
+        SimpleNamespace(browser_session=browser), coordinate_guard=coordinates
+    )
     observer.owner = "identity-fixture"
     capture = CaptureBarrierCandidate(
         observer, wait_for_transition=not args.skip_transition_wait
@@ -89,6 +98,7 @@ async def main():
         "cases": [],
         "violations": [],
         "wait_for_transition": not args.skip_transition_wait,
+        "frame_contract": args.frame_contract,
     }
     serial = 0
 
@@ -131,7 +141,7 @@ async def main():
         """
         return web.Response(
             content_type="text/html",
-            text="""<!doctype html><style>body{margin:0;height:2400px;background:#fff}button{position:absolute;left:80px;width:180px;height:40px}canvas{position:fixed;left:0;top:0;z-index:2}</style><canvas id="stamp" width="576" height="10"></canvas><button style="top:80px" onclick="parent.postMessage({clicked:'A'},'*')">A before scroll</button><button style="top:200px" onclick="parent.postMessage({clicked:'B'},'*')">B after scroll</button><script>onmessage=e=>{if(e.data.scroll!==undefined){scrollTo(0,e.data.scroll);requestAnimationFrame(()=>requestAnimationFrame(()=>parent.postMessage({scrolled:scrollY},'*')))}};const ctx=stamp.getContext('2d');function frame(){for(let bit=0;bit<32;bit++){ctx.fillStyle=(scrollY>>>bit)&1?'#fff':'#000';ctx.fillRect(bit*18,0,18,10)}requestAnimationFrame(frame)}frame()</script>""",
+            text="""<!doctype html><style>body{margin:0;height:2400px;background:#fff}button{position:absolute;left:80px;width:180px;height:40px}canvas{position:fixed;left:0;top:0;z-index:2}</style><canvas id="stamp" width="576" height="10"></canvas><button style="top:80px" onclick="parent.postMessage({clicked:'A'},'*')">A before scroll</button><button style="top:200px" onclick="parent.postMessage({clicked:'B'},'*')">B after scroll</button><script>onmessage=e=>{if(e.data.scroll!==undefined){scrollTo(0,e.data.scroll);requestAnimationFrame(()=>requestAnimationFrame(()=>parent.postMessage({scrolled:scrollY},'*')))}};for(const type of ['pointerdown','pointerup'])addEventListener(type,e=>parent.postMessage({type,x:e.clientX,y:e.clientY},'*'),true);const ctx=stamp.getContext('2d');function frame(){for(let bit=0;bit<32;bit++){ctx.fillStyle=(scrollY>>>bit)&1?'#fff':'#000';ctx.fillRect(bit*18,0,18,10)}requestAnimationFrame(frame)}frame()</script>""",
         )
 
     child_app = web.Application()
@@ -283,7 +293,7 @@ async def main():
                         _, cdp, before = await observer.read_state()
                         await cdp.cdp_client.send.Runtime.evaluate(
                             params={
-                                "expression": f"window.childEvents=[];addEventListener('message',e=>childEvents.push(e.data));const f=document.createElement('iframe');f.id='child';f.src='http://127.0.0.1:{child_port}/child';f.style='position:absolute;left:700px;top:150px;width:576px;height:400px;border:0';document.body.append(f)"
+                                "expression": f"window.childEvents=[];addEventListener('message',e=>childEvents.push(e.data));const f=document.createElement('iframe');f.id='child';f.src='http://{'localhost' if args.frame_contract else '127.0.0.1'}:{child_port}/child';f.style='position:absolute;left:700px;top:150px;width:576px;height:400px;border:0';document.body.append(f)"
                             },
                             session_id=cdp.session_id,
                         )
@@ -339,6 +349,13 @@ async def main():
                             session_id=cdp.session_id,
                         )
                         events = json.loads(child_info["result"]["value"])
+                        if args.frame_contract:
+                            assert (
+                                not old_still_matches
+                                and click_reply.get("status") == "stale"
+                                and not any(e.get("clicked") for e in events)
+                            ), (old_still_matches, click_reply, events)
+                            await capture.barrier()
                         fresh_child = await capture.next_frame()
                         (args.out / "iframe-after.jpg").write_bytes(
                             base64.b64decode(fresh_child["event"]["data"])
@@ -354,6 +371,95 @@ async def main():
                             "old_state": old["state"],
                             "current_state": current,
                         }
+                        if args.frame_contract:
+                            with Image.open(
+                                io.BytesIO(
+                                    base64.b64decode(fresh_child["event"]["data"])
+                                )
+                            ) as image:
+                                scale = (
+                                    image.width / fresh_child["state"]["viewport_width"]
+                                )
+                                image = image.convert("L")
+                                child_scroll = sum(
+                                    1 << bit
+                                    for bit in range(16)
+                                    if image.getpixel(
+                                        (
+                                            round((700 + bit * 18 + 9) * scale),
+                                            round(155 * scale),
+                                        )
+                                    )
+                                    > 128
+                                )
+                            assert child_scroll == 120, child_scroll
+                            native_hit = (
+                                await coordinates.client.send.DOM.getNodeForLocation(
+                                    params={
+                                        "x": 800,
+                                        "y": 250,
+                                        "includeUserAgentShadowDOM": True,
+                                    },
+                                    session_id=coordinates.root_session,
+                                )
+                            )
+                            (args.out / "native-hit.json").write_text(
+                                json.dumps(native_hit, indent=2)
+                            )
+                            input_id += 1
+                            async with http.post(
+                                manual_url,
+                                json={
+                                    **identity,
+                                    "operation": "click",
+                                    "input_id": input_id,
+                                    "control_epoch": epoch,
+                                    "x": 800,
+                                    "y": 250,
+                                    "target": fresh_child["state"],
+                                },
+                            ) as response:
+                                recovered = await response.json()
+                            await asyncio.sleep(0.05)
+                            child_info = await cdp.cdp_client.send.Runtime.evaluate(
+                                params={
+                                    "expression": "JSON.stringify(childEvents)",
+                                    "returnByValue": True,
+                                },
+                                session_id=cdp.session_id,
+                            )
+                            recovered_events = json.loads(child_info["result"]["value"])
+                            (args.out / "recovery-diagnostic.json").write_text(
+                                json.dumps(
+                                    {
+                                        "reply": recovered,
+                                        "events": recovered_events,
+                                        "top": (
+                                            await cdp.cdp_client.send.Runtime.evaluate(
+                                                params={
+                                                    "expression": "JSON.stringify({probe:identityProbe,hit:document.elementFromPoint(800,250)?.tagName,rect:child.getBoundingClientRect().toJSON(),dpr:devicePixelRatio})",
+                                                    "returnByValue": True,
+                                                },
+                                                session_id=cdp.session_id,
+                                            )
+                                        )["result"].get("value"),
+                                    },
+                                    indent=2,
+                                )
+                            )
+                            assert recovered.get("status") == "applied" and any(
+                                e.get("clicked") == "B" for e in recovered_events
+                            ), (recovered, recovered_events)
+                            iframe_result.update(
+                                recovered_status=recovered["status"],
+                                recovered_events=recovered_events,
+                                optical_child_scroll=child_scroll,
+                                frame_contract=coordinates.last_frames,
+                                coordinate_metrics=coordinates.metrics[-8:],
+                            )
+                            assert (
+                                len({f["session"] for f in coordinates.last_frames}) > 1
+                            ), "No actual OOPIF transport was observed."
                         result["cases"].append(iframe_result)
                         if (
                             old_still_matches
@@ -433,6 +539,10 @@ async def main():
                             round(truth["nested"]),
                             state["position_revision"],
                         ]
+                        assert record["snapshot_words"][:7] == expected, (
+                            record["snapshot_words"],
+                            expected,
+                        )
                         matches = words[:7] == expected
                         frame_result = {
                             "words": words,
@@ -503,6 +613,10 @@ async def main():
             f"Accepted {len(result['violations'])} frames whose painted identity differs."
         )
     finally:
+        if coordinates:
+            result["coordinate_last_error"] = coordinates.last_error
+            result["coordinate_metrics"] = coordinates.metrics
+            result["coordinate_frames"] = coordinates.last_frames
         await capture.close()
         await observer.close()
         await browser.kill()

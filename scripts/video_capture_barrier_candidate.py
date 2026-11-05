@@ -23,6 +23,10 @@ IDENTITY_FIELDS = (
     "scroll_y",
     "position_revision",
     "control_epoch",
+    "coordinate_contract_version",
+    "coordinate_token",
+    "frame_tree_token",
+    "coordinate_event_revision",
 )
 
 
@@ -210,7 +214,16 @@ class CaptureBarrierCandidate:
             record["media_session_id"] != self.session_id
             or record["media_epoch"] != self.epoch
             or self.anchor is None
+            or (
+                state.get("coordinate_contract_version") == 2
+                and not state.get("coordinate_ready")
+            )
             or self.identity(record["state"]) != self.identity(state)
+            or (
+                self.observer.coordinate_guard is not None
+                and record["state"].get("coordinate_event_revision")
+                != self.observer.coordinate_guard.dirty
+            )
         ):
             return False
         meta = record["event"]["metadata"]
