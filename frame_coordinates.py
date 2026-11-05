@@ -9,6 +9,8 @@ import json
 import time
 from uuid import uuid4
 
+from frame_dom import FrameDOM
+
 
 class CoordinateUnavailable(Exception):
     """The connected frame tree cannot currently authorize new input."""
@@ -46,6 +48,8 @@ class FrameCoordinates:
         self.last_owners = {}
         self.metrics = []
         self.last_error = None
+        self.dom = None
+        self.root_objects = {}
 
     async def close(self):
         """Release only this read-only CDP connection and its isolated contexts."""
@@ -54,6 +58,8 @@ class FrameCoordinates:
         self.pending.clear()
         self.contexts.clear()
         self.world_contexts.clear()
+        self.root_objects.clear()
+        self.dom = None
         self.target = None
         self.root_session = None
         if client:
@@ -71,6 +77,7 @@ class FrameCoordinates:
         await self.close()
         self.target = target
         self.client = client = CDPClient(self.browser.cdp_url)
+        dom = self.dom = FrameDOM(client)
 
         def changed(event, session_id):
             """Invalidate hints without using event data as an identity token.
@@ -94,6 +101,16 @@ class FrameCoordinates:
                 self.pending.add(event["sessionId"])
             changed(event, session_id)
 
+        def navigated(event, session_id):
+            """Rebuild native node bindings after any owning frame navigation.
+
+            Args:
+                event: Browser-supplied frame navigation.
+                session_id: Actual source target session.
+            """
+            dom.drop(session_id)
+            changed(event, session_id)
+
         def detached(event, session_id):
             """Forget disconnected transport contexts before their IDs can recur.
 
@@ -113,7 +130,13 @@ class FrameCoordinates:
                 for key, value in self.world_contexts.items()
                 if key[0] != removed
             }
+            self.root_objects = {
+                key: value
+                for key, value in self.root_objects.items()
+                if key[0] != removed
+            }
             self.pending.discard(removed)
+            dom.drop(removed)
             changed(event, session_id)
 
         def context_created(event, session_id):
@@ -134,7 +157,13 @@ class FrameCoordinates:
                 session_id: Source target transport.
             """
             cid = event["executionContextId"]
-            self.world_contexts.pop((session_id, cid), None)
+            native = self.world_contexts.pop((session_id, cid), {})
+            unique = native.get("uniqueId", event.get("executionContextUniqueId"))
+            self.root_objects = {
+                key: value
+                for key, value in self.root_objects.items()
+                if key[:2] != (session_id, unique)
+            }
             self.contexts = {
                 key: value
                 for key, value in self.contexts.items()
@@ -146,7 +175,7 @@ class FrameCoordinates:
         client.register.Target.detachedFromTarget(detached)
         client.register.Page.frameAttached(changed)
         client.register.Page.frameDetached(changed)
-        client.register.Page.frameNavigated(changed)
+        client.register.Page.frameNavigated(navigated)
         client.register.Runtime.bindingCalled(changed)
 
         def contexts_cleared(event, session_id):
@@ -159,6 +188,11 @@ class FrameCoordinates:
             self.world_contexts = {
                 key: value
                 for key, value in self.world_contexts.items()
+                if key[0] != session_id
+            }
+            self.root_objects = {
+                key: value
+                for key, value in self.root_objects.items()
                 if key[0] != session_id
             }
             self.contexts = {
@@ -293,35 +327,86 @@ class FrameCoordinates:
             raise CoordinateUnavailable(
                 "The isolated world does not belong to the requested frame."
             )
+        roots = sorted(
+            (node["backend"], node["shadow"])
+            for node in self.dom.roots.get(sid, {}).values()
+            if node["frame"] == fid and node["shadow"]
+        )
+        if len(roots) > 64:
+            raise CoordinateUnavailable(
+                "The shadow root inspection budget was exceeded."
+            )
+        arguments = []
+        for backend, _ in roots:
+            root_key = (sid, native["uniqueId"], backend)
+            if root_key not in self.root_objects:
+                resolved = await self.client.send.DOM.resolveNode(
+                    params={
+                        "backendNodeId": backend,
+                        "executionContextId": context,
+                        "objectGroup": self.world,
+                    },
+                    session_id=sid,
+                )
+                reference = resolved.get("object", {}).get("objectId")
+                if not reference:
+                    raise CoordinateUnavailable(
+                        "A native shadow root cannot be inspected."
+                    )
+                self.root_objects[root_key] = reference
+            arguments.append({"objectId": self.root_objects[root_key]})
+        removed = [
+            key
+            for key in self.root_objects
+            if key[:2] == (sid, native["uniqueId"])
+            and key[2] not in {root[0] for root in roots}
+        ]
+        for old in removed:
+            await self.client.send.Runtime.releaseObject(
+                params={"objectId": self.root_objects.pop(old)},
+                session_id=sid,
+            )
         expression = (
-            r"""JSON.stringify((()=>{
+            r"""function(...roots){return JSON.stringify((()=>{
 const key=KEY,nonce=NONCE,binding=BINDING;
 let s=globalThis[key];
 if(!s||s.doc!==document){
  const generation=s?(s.generation+1):0;
- s={doc:document,generation,revision:0,nodes:new Set(),ids:new WeakMap(),next:0,scans:0};
+ s={doc:document,generation,revision:0,nodes:new Set(),roots:new Set(),ids:new WeakMap(),next:0,scans:0};
  globalThis[key]=s;
  s.track=root=>{const nodes=[root,...(root.querySelectorAll?.('*')||[])];s.scans+=nodes.length;for(const n of nodes){if(!(n instanceof Element))continue;const c=getComputedStyle(n);if([c.overflowX,c.overflowY].some(v=>v!=='visible'&&v!=='clip')){s.nodes.add(n);if(!s.ids.has(n))s.ids.set(n,++s.next)}}};
  s.process=records=>{for(const r of records){if(r.type==='childList'){for(const n of r.addedNodes)s.track(n);let n=r.target;while(n instanceof Element){s.trackOne(n);n=n.parentElement}}else s.trackOne(r.target)}};
  s.trackOne=n=>{if(n instanceof Element){const c=getComputedStyle(n);if([c.overflowX,c.overflowY].some(v=>v!=='visible'&&v!=='clip')){s.nodes.add(n);if(!s.ids.has(n))s.ids.set(n,++s.next)}}};
  s.track(document);
- s.observer=new MutationObserver(s.process);s.observer.observe(document,{subtree:true,childList:true,attributes:true,attributeFilter:['style','class','hidden']});
- const changed=()=>{s.revision++;try{globalThis[binding]('changed')}catch{}};
- addEventListener('scroll',changed,true);addEventListener('resize',changed,true);
+ s.observer=new MutationObserver(s.process);
+ s.changed=()=>{s.revision++;try{globalThis[binding]('changed')}catch{}};
+ addEventListener('scroll',s.changed,true);addEventListener('resize',s.changed,true);
 }
 s.process(s.observer.takeRecords());
+const next=new Set(roots);
+if(roots.some(r=>!r.isConnected||r.ownerDocument!==document))throw Error('A native shadow root is detached or belongs to another document');
+if(next.size!==s.roots.size||roots.some(r=>!s.roots.has(r))){
+ s.observer.disconnect();
+ for(const old of s.roots)if(!next.has(old))old.removeEventListener('scroll',s.changed,true);
+ for(const root of roots)if(!s.roots.has(root)){s.track(root);root.addEventListener('scroll',s.changed,true)}
+ s.roots=next;s.changed();
+}
+for(const root of [document,...roots])s.observer.observe(root,{subtree:true,childList:true,attributes:true,attributeFilter:['style','class','hidden']});
 const active=document.activeViewTransition;if(active&&active!==s.transition){s.transition=active;s.visual=(s.visual||0)+1}
 const scrollers=[];for(const n of s.nodes){if(!n.isConnected){s.nodes.delete(n);continue}scrollers.push([s.ids.get(n),n.scrollLeft,n.scrollTop,n.clientWidth,n.clientHeight])}
 if(scrollers.length>512)throw Error('Scroller inspection budget exceeded');
 return{document:nonce+':'+s.generation,viewport:[innerWidth,innerHeight,devicePixelRatio],scroll:[scrollX,scrollY],revision:s.revision,visual:s.visual||0,scrollers,transition:!!active,ready:!!document.documentElement&&document.readyState!=='loading',focused:document.hasFocus()&&!(document.activeElement instanceof HTMLIFrameElement),scanned:s.scans};
-})())""".replace("KEY", json.dumps(self.key))
+})())}""".replace("KEY", json.dumps(self.key))
             .replace("NONCE", json.dumps(nonce))
             .replace("BINDING", json.dumps(self.binding))
         )
-        reply = await self.client.send.Runtime.evaluate(
+        # UA-root mode is supplied by native DOM metadata. Reading its .mode
+        # getter hung the pinned renderer; only generic Node/Element APIs are used.
+        reply = await self.client.send.Runtime.callFunctionOn(
             params={
-                "expression": expression,
-                "contextId": context,
+                "functionDeclaration": expression,
+                "executionContextId": context,
+                "arguments": arguments,
                 "returnByValue": True,
             },
             session_id=sid,
@@ -343,6 +428,8 @@ return{document:nonce+':'+s.generation,viewport:[innerWidth,innerHeight,devicePi
             "session": sid,
             "context": context,
             "context_unique": native["uniqueId"],
+            "shadow_roots": roots,
+            "shadow_revision": self.dom.revision,
             **data,
         }
 
@@ -366,6 +453,14 @@ return{document:nonce+':'+s.generation,viewport:[innerWidth,innerHeight,devicePi
                 if not self.client or self.target != target or not self.root_session:
                     await self._connect(target)
                 before = await self._trees()
+                sessions = {
+                    frame["session"]: frame["id"]
+                    for frame in before.values()
+                    if frame["parentId"] not in before
+                    or before[frame["parentId"]]["session"] != frame["session"]
+                }
+                await self.dom.sync(sessions)
+                shadow_revision = self.dom.revision
                 values = await asyncio.gather(
                     *(self._frame(frame) for frame in before.values())
                 )
@@ -424,6 +519,11 @@ return{document:nonce+':'+s.generation,viewport:[innerWidth,innerHeight,devicePi
                     raise CoordinateUnavailable(
                         "The frame tree changed during the coordinate check."
                     )
+                await self.dom.sync(sessions)
+                if self.dom.revision != shadow_revision:
+                    raise CoordinateUnavailable(
+                        "The native shadow tree changed during inspection."
+                    )
                 repeated = await asyncio.gather(
                     *(self._frame(frame) for frame in after.values())
                 )
@@ -434,6 +534,8 @@ return{document:nonce+':'+s.generation,viewport:[innerWidth,innerHeight,devicePi
                     "session",
                     "context",
                     "context_unique",
+                    "shadow_roots",
+                    "shadow_revision",
                     "document",
                     "viewport",
                     "scroll",
@@ -460,6 +562,10 @@ return{document:nonce+':'+s.generation,viewport:[innerWidth,innerHeight,devicePi
                 original_owners = dict(owners)
                 owners.clear()
                 await asyncio.gather(*(owner(frame) for frame in after.values()))
+                if self.dom.revision != shadow_revision:
+                    raise CoordinateUnavailable(
+                        "The native shadow tree changed during inspection."
+                    )
                 if original_owners != owners:
                     raise CoordinateUnavailable(
                         "Frame owner geometry changed during the authoritative read."
@@ -477,6 +583,8 @@ return{document:nonce+':'+s.generation,viewport:[innerWidth,innerHeight,devicePi
                             "session",
                             "context",
                             "context_unique",
+                            "shadow_roots",
+                            "shadow_revision",
                             "document",
                             "viewport",
                         )
@@ -513,6 +621,9 @@ return{document:nonce+':'+s.generation,viewport:[innerWidth,innerHeight,devicePi
                         "frames": len(values),
                         "sessions": len(set(v["session"] for v in values)),
                         "scanned": sum(v["scanned"] for v in values),
+                        "native_dom_full_scans": self.dom.full_scans,
+                        "native_dom_nodes_seen": self.dom.scanned,
+                        "shadow_roots": sum(len(v["shadow_roots"]) for v in values),
                     }
                 )
                 self.metrics = self.metrics[-256:]

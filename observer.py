@@ -406,6 +406,11 @@ class BrowserObserver:
             raise web.HTTPUnauthorized()
         body = await request.json()
         operation = body.get("operation")
+        terminal = (
+            operation == "reset_keys"
+            or (operation == "pointer" and body.get("phase") in {"up", "cancel"})
+            or (operation == "key" and body.get("phase") == "up")
+        )
         agent_observation = ""
         async with self._control_lock:
             browser = self.server.browser_session
@@ -475,10 +480,11 @@ class BrowserObserver:
                     or self.control_epoch != body.get("control_epoch")
                 ):
                     raise web.HTTPConflict(text="Human control expired.")
-                if self.control_mode != "human" and operation not in {
-                    "release",
-                    "disconnect",
-                }:
+                if (
+                    self.control_mode != "human"
+                    and operation not in {"release", "disconnect"}
+                    and not (self.coordinate_guard is not None and terminal)
+                ):
                     raise web.HTTPConflict(text="Browser input is paused.")
                 if operation in {"release", "disconnect"}:
                     self.control_mode = "paused"
@@ -523,14 +529,6 @@ class BrowserObserver:
                         return web.json_response(self.human["last_ack"])
                     if number != self.human["last_input"] + 1:
                         raise web.HTTPConflict(text="Input sequence expired.")
-                    terminal = (
-                        operation == "reset_keys"
-                        or (
-                            operation == "pointer"
-                            and body.get("phase") in {"up", "cancel"}
-                        )
-                        or (operation == "key" and body.get("phase") == "up")
-                    )
                     if self.coordinate_guard is not None and terminal:
                         self.human["last_input"] = number
                         self.human["last_ack"] = {
@@ -566,12 +564,15 @@ class BrowserObserver:
                                     and math.isfinite(body[k])
                                     for k in ("x", "y")
                                 ):
-                                    _, x, y = await self.coordinate_guard.route(
-                                        body["x"],
-                                        body["y"],
-                                        target=(self._drag_target or {}).get(
-                                            "input_frame"
+                                    _, x, y = await asyncio.wait_for(
+                                        self.coordinate_guard.route(
+                                            body["x"],
+                                            body["y"],
+                                            target=(self._drag_target or {}).get(
+                                                "input_frame"
+                                            ),
                                         ),
+                                        0.75,
                                     )
                                 await asyncio.wait_for(
                                     held.cdp_client.send.Input.dispatchMouseEvent(
@@ -615,6 +616,12 @@ class BrowserObserver:
                             except Exception:
                                 self.control_mode = "paused"
                                 return web.json_response(self.human["last_ack"])
+                        if (
+                            self.execution_state == "active"
+                            and not self._held_keys
+                            and self._held_mouse is None
+                        ):
+                            self.control_mode = "human"
                         self.applied_input_id = number
                         self.human["last_ack"] = {
                             "operation": operation,
@@ -767,31 +774,6 @@ class BrowserObserver:
                             for key in ("delta_x", "delta_y")
                         ):
                             raise web.HTTPBadRequest(text="Invalid wheel delta.")
-                        if self.coordinate_guard is not None:
-                            from frame_coordinates import CoordinateUnavailable
-
-                            try:
-                                routed_target, x, y = await self.coordinate_guard.route(
-                                    x,
-                                    y,
-                                    target=(drag_target or {}).get("input_frame")
-                                    if continuation
-                                    else None,
-                                )
-                                cdp = await browser.get_or_create_cdp_session(
-                                    target_id=routed_target, focus=False
-                                )
-                            except CoordinateUnavailable:
-                                await self.release_keys()
-                                self.human["last_input"] = number
-                                self.human["last_ack"] = {
-                                    "operation": operation,
-                                    "input_id": number,
-                                    "status": "stale",
-                                    "control_epoch": self.control_epoch,
-                                    "state": state,
-                                }
-                                return web.json_response(self.human["last_ack"])
                     elif operation == "text":
                         text = body.get("text")
                         if (
@@ -865,13 +847,65 @@ class BrowserObserver:
                                 type="keyDown", text="\r", unmodifiedText="\r"
                             )
                     if self.coordinate_guard is not None and operation in {
+                        "click",
+                        "wheel",
+                        "pointer",
                         "key",
                         "text",
                     }:
-                        routed_target, _, _ = await self.coordinate_guard.route()
-                        cdp = await browser.get_or_create_cdp_session(
-                            target_id=routed_target, focus=False
-                        )
+                        from frame_coordinates import CoordinateUnavailable
+
+                        deadline = time.monotonic() + 1
+                        try:
+                            if operation in {"key", "text"}:
+                                routed = self.coordinate_guard.route()
+                            else:
+                                routed = self.coordinate_guard.route(
+                                    x,
+                                    y,
+                                    target=(drag_target or {}).get("input_frame")
+                                    if continuation
+                                    else None,
+                                )
+                            routed_target, routed_x, routed_y = await asyncio.wait_for(
+                                routed, 1
+                            )
+                            cdp = await asyncio.wait_for(
+                                browser.get_or_create_cdp_session(
+                                    target_id=routed_target, focus=False
+                                ),
+                                max(0, deadline - time.monotonic()),
+                            )
+                            if operation not in {"key", "text"}:
+                                x, y = routed_x, routed_y
+                        except (
+                            CoordinateUnavailable,
+                            asyncio.TimeoutError,
+                            ValueError,
+                        ):
+                            # A cancelled read cannot later continue into dispatch.
+                            # Keep the independently owned input sessions for release.
+                            with contextlib.suppress(Exception):
+                                await asyncio.wait_for(self.coordinate_guard.close(), 1)
+                            state = {
+                                **state,
+                                "coordinate_ready": False,
+                                "coordinate_token": None,
+                            }
+                            self.human["last_input"] = number
+                            self.human["last_ack"] = {
+                                "operation": operation,
+                                "input_id": number,
+                                "status": "stale",
+                                "control_epoch": self.control_epoch,
+                                "state": state,
+                            }
+                            try:
+                                await self.release_keys()
+                            except web.HTTPConflict:
+                                self.human["last_ack"]["status"] = "uncertain"
+                            self.publish("state", state)
+                            return web.json_response(self.human["last_ack"])
                     # Consume before dispatch: an uncertain CDP response must never
                     # cause a retry to click twice.
                     self.human["last_input"] = number
