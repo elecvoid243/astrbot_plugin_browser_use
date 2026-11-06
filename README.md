@@ -33,6 +33,8 @@
 
 0.4.0 完整包包含固定的 aiortc 1.14.0、PyAV 16.0.1 和软件 VP8 编码依赖。`runtime/requirements.lock` 锁定所有 Windows x64 wheel 及 SHA256；`scripts/runtime-win-x64.json` 固定 Python、Chromium 和 pip 归档。构建校验原始归档后从 wheelhouse 以 `--no-index --require-hashes` 安装，不借用现有运行目录的包。
 
+安装路径支持中文和空格；请选择较短的 data 路径。Windows 原生 DLL 加载器可能拒绝过长的完整路径，安装器会在复制前检查并提示改用较短路径。升级时先停用插件，把旧目录移出 `plugins`，再运行安装器；不要移动或覆盖单独的 `plugin_data`。
+
 `runtime/runtime-check.json` 记录私有依赖、FFmpeg 版本/构建配置/许可证、1920×1080 编码检查及 DLL/PYD 哈希。Python、Chromium 和依赖 wheel 原有许可证与 notices 随包保留；各组件适用自己的上游许可证。用户机器不运行 pip，不把媒体依赖安装到 AstrBot。
 
 ## 有网打包

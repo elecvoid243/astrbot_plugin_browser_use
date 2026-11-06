@@ -304,6 +304,10 @@ def main() -> None:
                     "pip": args.pip_version,
                     "plugin_version": version,
                     "plugin_revision": revision,
+                    "installer_sha256": {
+                        name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+                        for name in ("install.cmd", "install.ps1")
+                    },
                     "manual_control_version": 1,
                     "keyboard_input_version": 1,
                     "pointer_input_version": 1,
