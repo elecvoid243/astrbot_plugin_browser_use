@@ -12,8 +12,24 @@ from PIL import Image
 
 import media_rtp
 from frame_records import TARGET_FIELDS, FrameRecords
-from media_rtp import RtpFrameAdapter
+from media_rtp import BrowserVp8Encoder, RtpFrameAdapter
 from media_track import BrowserVideoTrack
+
+
+def test_native_encoder_counters_describe_real_packets():
+    """Count actual independent software encoding without altering its payloads."""
+    encoder = BrowserVp8Encoder()
+    frame = av.VideoFrame(128, 96, "yuv420p")
+    for plane in frame.planes:
+        plane.update(bytes(plane.buffer_size))
+    frame.pts = 0
+    frame.time_base = Fraction(1, 30)
+    payloads, timestamp = encoder.encode(frame)
+    assert payloads and timestamp == 0
+    assert encoder.metrics["frames"] == 1
+    assert encoder.metrics["wall_ms"] > 0
+    assert encoder.metrics["calling_thread_ms"] >= 0
+    assert encoder.metrics["codec_threads"] >= 1
 
 
 @pytest.fixture

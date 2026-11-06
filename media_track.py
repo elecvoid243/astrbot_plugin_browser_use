@@ -22,6 +22,9 @@ class BrowserVideoTrack(VideoStreamTrack):
         self.queue = asyncio.Queue(maxsize=1)
         self.current = None
         self.live_epoch = live_epoch
+        self.replaced = 0
+        self.stale = 0
+        self.high_water = 0
 
     def push(self, frame, metadata):
         """Replace only pending video pixels, never ordered operator input.
@@ -34,7 +37,9 @@ class BrowserVideoTrack(VideoStreamTrack):
             return
         if self.queue.full():
             self.queue.get_nowait()
+            self.replaced += 1
         self.queue.put_nowait((frame, metadata))
+        self.high_water = max(self.high_water, self.queue.qsize())
 
     async def recv(self):
         """Copy native planes off-thread and bind the exact encoder input size.
@@ -51,6 +56,7 @@ class BrowserVideoTrack(VideoStreamTrack):
                 break
             original, metadata = item
             if not self.live_epoch(metadata["media_epoch"]):
+                self.stale += 1
                 continue
 
             def clone():
@@ -83,6 +89,7 @@ class BrowserVideoTrack(VideoStreamTrack):
 
             frame = await asyncio.to_thread(clone)
             if not self.live_epoch(metadata["media_epoch"]):
+                self.stale += 1
                 continue
             self.current = {**metadata, "width": frame.width, "height": frame.height}
             return frame

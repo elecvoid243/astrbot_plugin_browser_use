@@ -53,6 +53,8 @@ class BrowserMedia:
         self.last_epoch = -1
         self.metrics = []
         self.latest_frame = None
+        self.decoded_frames = 0
+        self.decode_ms = 0.0
 
     def authorize(self, request, body, *, closing=False):
         """Check the activation credential and the host-selected browser lifetime.
@@ -230,6 +232,31 @@ class BrowserMedia:
                     mime_type="video/VP8",
                 )
                 self.emit(viewer, {"type": "frame", **record})
+                if source["media_sequence"] % 60 == 0:
+                    adapter = viewer["adapter"]
+                    encoder = viewer["sender"]._RTCRtpSender__encoder
+                    self.emit(
+                        viewer,
+                        {
+                            "type": "media-stats",
+                            "media_session_id": viewer["media_session_id"],
+                            "elapsed_s": time.monotonic() - viewer["created"],
+                            "encoder": dict(encoder.metrics),
+                            "sent_bytes": adapter.sent_bytes,
+                            "track_replaced": track.replaced,
+                            "track_stale": track.stale,
+                            "track_high_water": track.high_water,
+                            "metadata_queue": viewer["events"].qsize(),
+                            "shared_source": {
+                                "decoded_frames": self.decoded_frames,
+                                "decode_ms": self.decode_ms,
+                                "capture_sequence": self.capture.sequence,
+                                "capture_pending": self.capture.pending.qsize(),
+                                "ack_pending": self.capture.acks.qsize(),
+                                "viewers": len(self.viewers),
+                            },
+                        },
+                    )
 
             try:
                 sender = peer.addTrack(track)
@@ -513,6 +540,8 @@ class BrowserMedia:
                             return frame
 
                     frame = await asyncio.to_thread(decode)
+                    self.decoded_frames += 1
+                    self.decode_ms += (time.monotonic() - started) * 1000
                     if (
                         self.capture.anchor is None
                         or record["media_epoch"] != self.capture.epoch

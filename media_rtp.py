@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import struct
+import time
 from collections import deque
 from importlib.metadata import version
 
@@ -18,6 +19,26 @@ class BrowserVp8Encoder(Vp8Encoder):
         """Initialize software inter-frame encoding without changing global defaults."""
         super().__init__()
         self.target_bitrate = 4_000_000
+        self.metrics = {"frames": 0, "wall_ms": 0.0, "calling_thread_ms": 0.0}
+
+    def encode(self, frame, force_keyframe=False):
+        """Record bounded per-encoder counters around actual software encoding.
+
+        Args:
+            frame: Owned native encoder input, never a shared mutable frame.
+            force_keyframe: Native sender request for an intra frame.
+
+        Returns:
+            The unchanged encoded payloads and timestamp.
+        """
+        started, cpu = time.perf_counter(), time.thread_time()
+        try:
+            return super().encode(frame, force_keyframe)
+        finally:
+            self.metrics["frames"] += 1
+            self.metrics["wall_ms"] += (time.perf_counter() - started) * 1000
+            self.metrics["calling_thread_ms"] += (time.thread_time() - cpu) * 1000
+            self.metrics["codec_threads"] = self.codec.thread_count if self.codec else 0
 
     @Vp8Encoder.target_bitrate.setter
     def target_bitrate(self, bitrate):
@@ -70,6 +91,7 @@ class RtpFrameAdapter:
         self.payload_type = None
         self.seen = deque(maxlen=128)
         self.sequence = 0
+        self.sent_bytes = 0
         sender._RTCRtpSender__encoder = BrowserVp8Encoder()
         sender._next_encoded_frame = self.next_frame
         sender.transport._send_rtp = self.send_rtp
@@ -103,6 +125,7 @@ class RtpFrameAdapter:
             data: Actual RTP or RTCP packet from this owned aiortc transport.
         """
         await self.original_send(data)
+        self.sent_bytes += len(data)
         if (
             len(data) < 12
             or data[0] >> 6 != 2
