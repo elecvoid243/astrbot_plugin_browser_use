@@ -23,6 +23,13 @@ SOURCE_FILES = (
     "observer.py",
     "observation_queue.py",
     "owned_tool.py",
+    "browser_capture.py",
+    "browser_media.py",
+    "frame_coordinates.py",
+    "frame_dom.py",
+    "frame_records.py",
+    "media_rtp.py",
+    "media_track.py",
     "metadata.yaml",
     "_conf_schema.json",
     "requirements.txt",
@@ -122,6 +129,7 @@ def main() -> None:
         source_paths = [ROOT / name for name in SOURCE_FILES]
         source_paths.extend((ROOT / "scripts").glob("*.py"))
         source_paths.append(ROOT / "scripts/requirements-win-x64.lock")
+        source_paths.append(ROOT / "scripts/runtime-win-x64.json")
         for path in source_paths:
             archive.write(path, Path(ROOT.name) / path.relative_to(ROOT))
     if args.source_only:
@@ -146,6 +154,12 @@ def main() -> None:
     build_dir = ROOT / ".build"
     cache_dir = build_dir / "downloads"
     cache_dir.mkdir(parents=True, exist_ok=True)
+    runtime_lock = json.loads(
+        (ROOT / "scripts/runtime-win-x64.json").read_text(encoding="utf-8")
+    )
+    for name in ("python", "chrome", "pip"):
+        if getattr(args, f"{name}_version") != runtime_lock["versions"][name]:
+            parser.error(f"{name} version must match scripts/runtime-win-x64.json.")
     python_archive = download(
         f"https://www.python.org/ftp/python/{args.python_version}/"
         f"python-{args.python_version}-embed-amd64.zip",
@@ -156,6 +170,12 @@ def main() -> None:
         "win64/chrome-win64.zip",
         cache_dir / args.chrome_version,
     )
+    for path in (python_archive, chrome_archive):
+        if (
+            hashlib.sha256(path.read_bytes()).hexdigest()
+            != runtime_lock["inputs_sha256"][path.name]
+        ):
+            raise ValueError(f"Runtime archive checksum mismatch: {path.name}")
     with tempfile.TemporaryDirectory(prefix="offline-", dir=build_dir) as temporary:
         staging = Path(temporary).resolve()
         if not staging.is_relative_to(build_dir.resolve()):
@@ -200,6 +220,11 @@ def main() -> None:
             ],
         )
         pip_wheel = cache_dir / f"pip-{args.pip_version}-py3-none-any.whl"
+        if (
+            hashlib.sha256(pip_wheel.read_bytes()).hexdigest()
+            != runtime_lock["inputs_sha256"][pip_wheel.name]
+        ):
+            raise ValueError("Pinned pip wheel checksum mismatch.")
         with zipfile.ZipFile(pip_wheel) as archive:
             archive.extractall(site_packages)
         wheelhouse = staging / "wheelhouse"
@@ -253,6 +278,16 @@ def main() -> None:
             ],
         )
         run_step([str(python_exe), "-X", "utf8", "-m", "pip", "check"])
+        run_step(
+            [
+                str(python_exe),
+                "-X",
+                "utf8",
+                str(plugin / "scripts/check_runtime.py"),
+                "--report",
+                str(runtime_dir / "runtime-check.json"),
+            ]
+        )
         with zipfile.ZipFile(chrome_archive) as archive:
             archive.extractall(staging / "chrome")
         shutil.copytree(staging / "chrome" / "chrome-win64", runtime_dir / "chromium")
@@ -272,6 +307,12 @@ def main() -> None:
                     "manual_control_version": 1,
                     "keyboard_input_version": 1,
                     "pointer_input_version": 1,
+                    "drag_input_version": 1,
+                    "coordinate_contract_version": 2,
+                    "video_stream_version": 1,
+                    "frame_provenance_version": 1,
+                    "aiortc": "1.14.0",
+                    "av": "16.0.1",
                     "astrbot_revision": args.astrbot_revision,
                     "dashboard_sha256": args.dashboard_sha256,
                     "source_sha256": {

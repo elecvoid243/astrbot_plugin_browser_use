@@ -1,0 +1,12 @@
+{
+  "versions": {
+    "python": "3.13.17",
+    "chrome": "156.0.8078.47",
+    "pip": "26.2.2"
+  },
+  "inputs_sha256": {
+    "python-3.13.17-embed-amd64.zip": "9e35319bffedab8b36ad44d8f377cb4f1733bcec257a0b6d04d94f01486ddb38",
+    "chrome-win64.zip": "a4e0d57245e167e98a9d465af1e3774d2b4ec9f04e483d19bcd97a6f63cf46dd",
+    "pip-26.2.2-py3-none-any.whl": "fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
+  }
+}

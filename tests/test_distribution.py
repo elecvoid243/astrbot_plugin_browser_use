@@ -14,7 +14,12 @@ def test_source_zip_contains_local_imports_and_runtime_lock():
         [sys.executable, str(root / "scripts/build_offline.py"), "--source-only"],
         check=True,
     )
-    archive_path = root / "dist" / f"{root.name}-0.3.0-source.zip"
+    version = next(
+        line.split(":", 1)[1].strip().removeprefix("v")
+        for line in (root / "metadata.yaml").read_text(encoding="utf-8").splitlines()
+        if line.startswith("version:")
+    )
+    archive_path = root / "dist" / f"{root.name}-{version}-source.zip"
     with zipfile.ZipFile(archive_path) as archive:
         names = set(archive.namelist())
         for member in names:
