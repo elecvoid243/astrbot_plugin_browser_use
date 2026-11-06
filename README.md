@@ -37,6 +37,8 @@
 
 `runtime/runtime-check.json` 记录私有依赖、FFmpeg 版本/构建配置/许可证、1920×1080 编码检查及 DLL/PYD 哈希。Python、Chromium 和依赖 wheel 原有许可证与 notices 随包保留；各组件适用自己的上游许可证。用户机器不运行 pip，不把媒体依赖安装到 AstrBot。
 
+`scripts/licenses` 另附 FFmpeg 的 GPL/LGPL 文本及 PyAV 16.0.1 所用的 8.0-2 原生构建来源和源码 SHA256。该上游构建补丁修改了 x264/x265 的许可证分类；DLL 自报 LGPLv3 不能代替这些独立组件的许可证。分发时应一并保留来源、补丁记录、许可证及 wheel notices，不能把整个原生依赖树标为 BSD。
+
 ## 有网打包
 
 构建脚本需要 Windows x64 和 Python 3.11+（附带 pip）。它会：

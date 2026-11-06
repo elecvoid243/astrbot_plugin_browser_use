@@ -71,6 +71,16 @@ def main():
     library = ctypes.CDLL(str(next((site / "av.libs").glob("avcodec-*.dll"))))
     library.avcodec_license.restype = ctypes.c_char_p
     library.avcodec_configuration.restype = ctypes.c_char_p
+    licenses = Path(__file__).resolve().parent / "licenses"
+    provenance = json.loads(
+        (licenses / "native-provenance.json").read_text(encoding="utf-8")
+    )
+    for name, entry in provenance["license_texts"].items():
+        if (
+            hashlib.sha256((licenses / name).read_bytes()).hexdigest()
+            != entry["sha256"]
+        ):
+            raise RuntimeError(f"Native license text failed verification: {name}")
     report = {
         "python": sys.version,
         "executable": str(Path(sys.executable).resolve()),
@@ -82,6 +92,7 @@ def main():
         "ffmpeg_license": library.avcodec_license().decode(),
         "ffmpeg_configuration": library.avcodec_configuration().decode(),
         "ffmpeg_source": "https://ffmpeg.org/releases/ffmpeg-8.0.tar.xz",
+        "native_provenance": provenance,
         "encoder": "libvpx",
         "encoded_dimensions": [encoder.width, encoder.height],
         "packages": sorted(packages, key=lambda package: package["name"].lower()),

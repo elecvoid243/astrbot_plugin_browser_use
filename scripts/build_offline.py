@@ -130,6 +130,9 @@ def main() -> None:
         source_paths.extend((ROOT / "scripts").glob("*.py"))
         source_paths.append(ROOT / "scripts/requirements-win-x64.lock")
         source_paths.append(ROOT / "scripts/runtime-win-x64.json")
+        source_paths.extend(
+            path for path in (ROOT / "scripts/licenses").rglob("*") if path.is_file()
+        )
         for path in source_paths:
             archive.write(path, Path(ROOT.name) / path.relative_to(ROOT))
     if args.source_only:
