@@ -76,6 +76,18 @@ python scripts/browser_observer_acceptance.py --plugin-zip D:/delivery/astrbot_p
 
 ## 源码开发或复用现成环境
 
+配套的新版宿主和 Dashboard 可协商本地 WebRTC 视频；私有 Python 需具备已验证的
+aiortc `1.14.0`、PyAV `16.0.1` 与 libvpx。缺少依赖或接收端帧元数据能力时保留 JPEG，
+不要把这些库安装进 AstrBot 的 Python。源码的视频支持不代表现有离线 ZIP 已包含这些依赖；
+应以最终包的锁文件、清单和安装验收为准。
+
+视频与人工输入分离，使用原有接管租约和有序输入 WebSocket。媒体票据仅由宿主为当前账号
+拥有的聊天签发，双方不配置公网 STUN/TURN。视频故障保留人工所有权，可明确重试或切换
+JPEG。新画面必须带实际呈现帧对应的签发记录与完整坐标 token；缺字段不会降级保护。
+同源、跨源/OOPIF、open/closed shadow 的坐标不明确时暂停新输入，已有松开和重置仍走原
+输入会话；这不承诺任意 DOM/动画语义的原子点击。实际帧率和交互延迟取决于页面、分辨率
+与机器，不能将上限或目标值当作保证。
+
 插件的 `requirements.txt` 没有宿主依赖。不要将 `browser-use` 安装进 AstrBot 的 Python；当前双方对 MCP、psutil、reportlab 的版本要求有冲突。
 
 将插件放入 AstrBot 的插件目录，或上传构建出的 `*-source.zip`；然后在插件设置中填写（环境未配置时会提示加载失败，配置后重载即可）：

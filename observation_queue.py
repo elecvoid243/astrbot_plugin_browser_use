@@ -9,7 +9,8 @@ ACTION_LIMIT = 128
 class ObservationQueue:
     """Keep one image, one state and a bounded ordered action backlog per viewer."""
 
-    def __init__(self):
+    def __init__(self, *, include_frames=True):
+        self.include_frames = include_frames
         self.actions = deque()
         self.latest = None
         self.state = None
@@ -30,6 +31,8 @@ class ObservationQueue:
                 event = {**event, "type": "state", "action_reset": True}
             self.actions.append(event)
         elif event.get("type") == "frame":
+            if not self.include_frames:
+                return
             self.latest = event
         else:
             # Control/heartbeat metadata must not erase the only new pixels of

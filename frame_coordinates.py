@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import math
 import time
 from uuid import uuid4
 
@@ -395,7 +396,7 @@ for(const root of [document,...roots])s.observer.observe(root,{subtree:true,chil
 const active=document.activeViewTransition;if(active&&active!==s.transition){s.transition=active;s.visual=(s.visual||0)+1}
 const scrollers=[];for(const n of s.nodes){if(!n.isConnected){s.nodes.delete(n);continue}scrollers.push([s.ids.get(n),n.scrollLeft,n.scrollTop,n.clientWidth,n.clientHeight])}
 if(scrollers.length>512)throw Error('Scroller inspection budget exceeded');
-return{document:nonce+':'+s.generation,viewport:[innerWidth,innerHeight,devicePixelRatio],scroll:[scrollX,scrollY],revision:s.revision,visual:s.visual||0,scrollers,transition:!!active,ready:!!document.documentElement&&document.readyState!=='loading',focused:document.hasFocus()&&!(document.activeElement instanceof HTMLIFrameElement),scanned:s.scans};
+const v=visualViewport;return{document:nonce+':'+s.generation,viewport:[innerWidth,innerHeight,devicePixelRatio,v?.scale??1,v?.offsetLeft??0,v?.offsetTop??0,v?.width??innerWidth,v?.height??innerHeight],scroll:[scrollX,scrollY],revision:s.revision,visual:s.visual||0,scrollers,transition:!!active,ready:!!document.documentElement&&document.readyState!=='loading',focused:document.hasFocus()&&!(document.activeElement instanceof HTMLIFrameElement),scanned:s.scans};
 })())}""".replace("KEY", json.dumps(self.key))
             .replace("NONCE", json.dumps(nonce))
             .replace("BINDING", json.dumps(self.binding))
@@ -421,6 +422,8 @@ return{document:nonce+':'+s.generation,viewport:[innerWidth,innerHeight,devicePi
             raise CoordinateUnavailable(
                 "A frame is loading or showing a view transition."
             )
+        if not math.isclose(data["viewport"][3], 1, rel_tol=0, abs_tol=0.001):
+            raise CoordinateUnavailable("A pinch-scaled visual viewport is not ready.")
         return {
             "frame": fid,
             "parent": frame["parentId"],

@@ -137,6 +137,12 @@ class BrowserUsePlugin(Star):
                     ["POST"],
                     "Authenticated host browser control channel.",
                 )
+                self.context.register_web_api(
+                    "/browser-use/media",
+                    self.browser_media,
+                    ["POST"],
+                    "Authenticated host browser media signaling channel.",
+                )
                 for control in ("stop", "close", "viewport"):
                     self.context.register_web_api(
                         f"/browser-use/{control}",
@@ -286,6 +292,7 @@ class BrowserUsePlugin(Star):
                 "close",
                 "snapshot",
                 "stream",
+                "media",
             }:
                 return error_response("Browser session expired.", status_code=409)
             return json_response(
@@ -302,7 +309,15 @@ class BrowserUsePlugin(Star):
         lease = self._lease
         token = self._bridge_token
         path = request.path.rsplit("/", 1)[-1]
-        if path not in {"snapshot", "stream", "stop", "close", "manual", "viewport"}:
+        if path not in {
+            "snapshot",
+            "stream",
+            "stop",
+            "close",
+            "manual",
+            "viewport",
+            "media",
+        }:
             path = "status"
         try:
             if self._bridge_file is None:
@@ -317,13 +332,14 @@ class BrowserUsePlugin(Star):
                 "close",
                 "manual",
                 "viewport",
+                "media",
             } and (not generation or not browser_session_id):
                 return error_response("Browser identity is required.", status_code=400)
             if generation is not None and generation != bridge["generation"]:
                 return error_response("Browser generation expired.", status_code=409)
             private_path = (
                 "identity"
-                if path in {"stop", "close", "manual", "viewport"}
+                if path in {"stop", "close", "manual", "viewport", "media"}
                 else "snapshot"
                 if path == "snapshot"
                 else "status"
@@ -345,7 +361,7 @@ class BrowserUsePlugin(Star):
             if (
                 not self._enabled
                 or self._owner != owner
-                or self._lease != lease
+                or (path != "media" and self._lease != lease)
                 or self._bridge_token != token
             ):
                 return error_response("Browser ownership expired.", status_code=409)
@@ -354,6 +370,62 @@ class BrowserUsePlugin(Star):
                 and browser_session_id != state["browser_session_id"]
             ):
                 return error_response("Browser session expired.", status_code=409)
+            if path == "media":
+                command = getattr(request, "browser_media", None)
+                if not isinstance(command, dict) or command.get("operation") not in {
+                    "offer",
+                    "events",
+                    "close",
+                }:
+                    return error_response(
+                        "Authenticated media channel required.", status_code=403
+                    )
+                if (
+                    command["operation"] != "close"
+                    and state.get("video_stream_version") != 1
+                ):
+                    return error_response(
+                        "Video capability unavailable; use JPEG.", status_code=409
+                    )
+                viewer_id = command["viewer_id"]
+                if command["operation"] == "events":
+                    return self.browser_media_stream(
+                        bridge, owner, token, browser_session_id, viewer_id
+                    )
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=15)
+                ) as client:
+                    async with client.post(
+                        f"http://127.0.0.1:{int(bridge['port'])}/media/{command['operation']}",
+                        headers={"Authorization": f"Bearer {token}"},
+                        json={
+                            "owner": owner,
+                            "generation": bridge["generation"],
+                            "browser_session_id": browser_session_id,
+                            "viewer_id": viewer_id,
+                            **(
+                                {"sdp": command["sdp"], "type": "offer"}
+                                if command["operation"] == "offer"
+                                else {}
+                            ),
+                        },
+                    ) as response:
+                        if response.status != 200:
+                            return error_response(
+                                "Browser media unavailable.",
+                                status_code=response.status,
+                            )
+                        result = await response.json()
+                if (
+                    not self._enabled
+                    or self._owner != owner
+                    or self._bridge_token != token
+                ):
+                    return error_response("Browser ownership expired.", status_code=409)
+                return json_response(
+                    {"status": "ok", "data": result},
+                    headers={"Cache-Control": "no-store"},
+                )
             if path == "viewport":
                 if self._operation_lock.locked():
                     return error_response(
@@ -492,6 +564,7 @@ class BrowserUsePlugin(Star):
                     self._bridge_token,
                     browser_session_id,
                     str(action_cursor),
+                    request.query.get("frames", "1"),
                 )
             return json_response(
                 {"status": "ok", "data": state}, headers={"Cache-Control": "no-store"}
@@ -516,6 +589,70 @@ class BrowserUsePlugin(Star):
         return await self.browser_observation()
 
     browser_manual.__astrbot_chat_guard__ = "browser-owned-chat-control-v1"
+
+    async def browser_media(self):
+        """Accept signaling only from the host's account-bound media socket.
+
+        Returns:
+            A private peer answer, bounded event stream or cleanup acknowledgement.
+        """
+        if getattr(request, "browser_media", None) is None:
+            return error_response(
+                "Authenticated media channel required.", status_code=403
+            )
+        return await self.browser_observation()
+
+    browser_media.__astrbot_chat_guard__ = "browser-owned-chat-media-v1"
+
+    def browser_media_stream(self, bridge, owner, token, browser_session_id, viewer_id):
+        """Bind the private RTP metadata subscription to this host-selected viewer.
+
+        Args:
+            bridge: Current activation's protected loopback endpoint.
+            owner: Trusted chat origin admitted by the host.
+            token: Captured private activation credential.
+            browser_session_id: The actual browser selected by the host.
+            viewer_id: Connection ID from the one-use signed host ticket.
+
+        Returns:
+            A bounded stream whose cancellation retires the private viewer.
+        """
+
+        async def events():
+            """Yield private metadata only while account-selected ownership persists.
+
+            Yields:
+                Bounded SSE blocks for this viewer, including idle heartbeats.
+            """
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None, sock_connect=5, sock_read=5)
+            ) as client:
+                async with client.get(
+                    f"http://127.0.0.1:{int(bridge['port'])}/media/events",
+                    params={
+                        "owner": owner,
+                        "generation": bridge["generation"],
+                        "browser_session_id": browser_session_id,
+                        "viewer_id": viewer_id,
+                    },
+                    headers={"Authorization": f"Bearer {token}"},
+                ) as response:
+                    response.raise_for_status()
+                    async for chunk in response.content.iter_chunked(65536):
+                        if (
+                            not self._enabled
+                            or self._owner != owner
+                            or self._bridge_token != token
+                        ):
+                            yield b'data: {"type":"revoked"}\n\n'
+                            break
+                        yield chunk
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
 
     # The host admits only the actual ownership-aware observer, including old
     # installations where an unguarded handler may still occupy the same route.
@@ -588,7 +725,7 @@ class BrowserUsePlugin(Star):
             )
 
     def browser_stream(
-        self, bridge, owner, token, browser_session_id, action_cursor="0"
+        self, bridge, owner, token, browser_session_id, action_cursor="0", frames="1"
     ):
         """Proxy bounded SSE while continuously checking the admitted owner.
 
@@ -598,6 +735,7 @@ class BrowserUsePlugin(Star):
             token: Credential for this plugin activation only.
             browser_session_id: Validated browser lifetime identity.
             action_cursor: Last applied action sequence for bounded recovery.
+            frames: Include JPEG frames, or subscribe to state/actions only.
 
         Returns:
             A streaming response whose cancellation closes its private subscription.
@@ -626,6 +764,7 @@ class BrowserUsePlugin(Star):
                                 "generation": bridge["generation"],
                                 "browser_session_id": browser_session_id,
                                 "action_cursor": action_cursor,
+                                "frames": frames,
                             },
                             headers={"Authorization": f"Bearer {token}"},
                         ) as response:

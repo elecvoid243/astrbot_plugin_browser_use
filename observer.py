@@ -19,6 +19,8 @@ from uuid import uuid4
 from aiohttp import web
 from PIL import Image
 
+from browser_capture import IDENTITY_FIELDS
+from frame_records import TARGET_FIELDS, FrameRecords
 from observation_queue import ACTION_LIMIT, ObservationQueue
 
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
@@ -47,13 +49,14 @@ position_revision:window[key].revision};
 class BrowserObserver:
     """Expose a credential-protected loopback bridge in the private runtime."""
 
-    def __init__(self, server, *, coordinate_guard=None):
+    def __init__(self, server, *, coordinate_guard=None, protect_coordinates=False):
         """Attach to the existing MCP server without starting another browser.
 
         Args:
             server: Upstream BrowserUseServer that executes Agent tools.
-            coordinate_guard: Optional frame-tree contract for the isolated V02
-                rollout. Existing runtimes retain their version-one behavior.
+            coordinate_guard: Explicit owned guard used by focused regression probes.
+            protect_coordinates: Enable production guard lifecycle and issued-frame
+                validation. This is an internal runtime capability, not a user setting.
         """
         self.server = server
         self.generation = uuid4().hex
@@ -91,6 +94,10 @@ class BrowserObserver:
         self._snapshot_lock = asyncio.Lock()
         self._snapshot_session = None
         self.coordinate_guard = coordinate_guard
+        self.protect_coordinates = protect_coordinates
+        self._coordinate_lock = asyncio.Lock()
+        self.frame_records = FrameRecords() if protect_coordinates else None
+        self.media = None
 
     async def start(self) -> None:
         """Bind an ephemeral loopback port and publish its discovery record.
@@ -107,6 +114,13 @@ class BrowserObserver:
         app.router.add_post("/control", self.control)
         app.router.add_post("/manual", self.manual)
         app.router.add_post("/viewport", self.viewport)
+        if self.protect_coordinates:
+            from browser_media import BrowserMedia
+
+            self.media = BrowserMedia(self)
+            app.router.add_post("/media/offer", self.media.offer)
+            app.router.add_get("/media/events", self.media.events)
+            app.router.add_post("/media/close", self.media.disconnect)
         self.runner = web.AppRunner(app, access_log=None)
         await self.runner.setup()
         site = web.TCPSite(self.runner, "127.0.0.1", 0)
@@ -133,6 +147,28 @@ class BrowserObserver:
             HTTPConflict: The browser switches targets during the read.
         """
         browser = self.server.browser_session
+        if self.protect_coordinates and (
+            (self.coordinate_guard is None and browser is not None)
+            or (
+                self.coordinate_guard is not None
+                and self.coordinate_guard.browser is not browser
+            )
+        ):
+            async with self._coordinate_lock:
+                if (
+                    self.coordinate_guard is not None
+                    and self.coordinate_guard.browser is not browser
+                ):
+                    # Held input belongs to the old browser, even after its server
+                    # reference changes. Never bind its guard to the replacement.
+                    await self.release_keys()
+                    await self.coordinate_guard.close()
+                    self.coordinate_guard = None
+                    self.frame_records.clear()
+                if self.coordinate_guard is None and browser is not None:
+                    from frame_coordinates import FrameCoordinates
+
+                    self.coordinate_guard = FrameCoordinates(browser)
         state = {
             "generation": self.generation,
             "browser_session_id": browser.id if browser else None,
@@ -154,8 +190,9 @@ class BrowserObserver:
             "width": 0,
             "height": 0,
             **self.action_state(browser.id if browser else None),
+            **(self.media.capability if self.media is not None else {}),
         }
-        if self.coordinate_guard is not None:
+        if self.coordinate_guard is not None or self.protect_coordinates:
             state.update(
                 coordinate_contract_version=2,
                 coordinate_ready=False,
@@ -699,6 +736,24 @@ class BrowserObserver:
                                 or target.get("coordinate_token")
                                 != state.get("coordinate_token")
                             )
+                        if self.frame_records is not None:
+                            if continuation:
+                                coordinate_stale = coordinate_stale or any(
+                                    target.get(key) != (drag_target or {}).get(key)
+                                    for key in TARGET_FIELDS
+                                )
+                            else:
+                                coordinate_stale = (
+                                    coordinate_stale
+                                    or not self.frame_records.matches(target, state)
+                                    or (
+                                        target.get("media_session_id") is not None
+                                        and (
+                                            self.media is None
+                                            or not self.media.accepts(target)
+                                        )
+                                    )
+                                )
                     if (
                         operation != "reset_keys"
                         and not (operation == "pointer" and phase == "cancel")
@@ -930,6 +985,13 @@ class BrowserObserver:
                                             coordinate_token=state["coordinate_token"],
                                             frame_tree_token=state["frame_tree_token"],
                                             input_frame=routed_target,
+                                        )
+                                    if self.frame_records is not None:
+                                        self._drag_target.update(
+                                            {
+                                                key: target.get(key)
+                                                for key in TARGET_FIELDS
+                                            }
                                         )
                                 await asyncio.wait_for(
                                     cdp.cdp_client.send.Input.dispatchMouseEvent(
@@ -1354,6 +1416,19 @@ class BrowserObserver:
                     )
                     cached = (browser, state["tab_id"], client, attached["sessionId"])
                     self._snapshot_session = cached
+                if self.protect_coordinates:
+                    # A new document can precede its first compositor pixels.
+                    # Keep the same paint barrier for production JPEG recovery.
+                    await asyncio.wait_for(
+                        cached[2].send.Runtime.evaluate(
+                            params={
+                                "expression": "new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve(true))))",
+                                "awaitPromise": True,
+                            },
+                            session_id=cached[3],
+                        ),
+                        2,
+                    )
                 shot = await cached[2].send.Page.captureScreenshot(
                     params={
                         "format": "jpeg",
@@ -1442,6 +1517,8 @@ class BrowserObserver:
             or browser.agent_focus_target_id != state["tab_id"]
         ):
             raise web.HTTPConflict(text="Browser target changed; refresh observation.")
+        if self.frame_records is not None:
+            state["frame_id"] = self.frame_records.add(state)["frame_id"]
         return state
 
     async def observe(self, request: web.Request) -> web.Response:
@@ -1475,6 +1552,15 @@ class BrowserObserver:
                     "drag_input_version": 1,
                     "viewport_resize_version": 1,
                     "applied_input_id": self.applied_input_id,
+                    **(self.media.capability if self.media is not None else {}),
+                    **(
+                        {
+                            "coordinate_contract_version": 2,
+                            "frame_provenance_version": 1,
+                        }
+                        if self.protect_coordinates
+                        else {}
+                    ),
                 },
                 headers={"Cache-Control": "no-store"},
             )
@@ -1483,7 +1569,22 @@ class BrowserObserver:
             return web.json_response(state, headers={"Cache-Control": "no-store"})
         target = state["tab_id"]
         if request.path == "/snapshot":
-            state = await self.capture_snapshot(browser, cdp, state)
+            for attempt in range(3 if self.protect_coordinates else 1):
+                try:
+                    state = await asyncio.wait_for(
+                        self.capture_snapshot(browser, cdp, state), 3
+                    )
+                    break
+                except web.HTTPConflict:
+                    if attempt == 2 or not self.protect_coordinates:
+                        raise
+                    previous = browser
+                    browser, cdp, state = await self.read_state()
+                    if browser is not previous or cdp is None:
+                        raise web.HTTPConflict(
+                            text="Browser changed during snapshot recovery."
+                        ) from None
+                    target = state["tab_id"]
             self.sequence += 1
             state["sequence"] = self.sequence
         # A concurrent tab switch must never label an old image as the new page.
@@ -1513,7 +1614,9 @@ class BrowserObserver:
         browser, _, state = await self.read_state()
         if browser is None or request.query.get("browser_session_id") != browser.id:
             raise web.HTTPConflict(text="Browser session expired.")
-        queue = ObservationQueue()
+        if request.query.get("frames", "1") not in {"0", "1"}:
+            raise web.HTTPBadRequest(text="Invalid frame subscription.")
+        queue = ObservationQueue(include_frames=request.query.get("frames") != "0")
         try:
             cursor = int(request.query.get("action_cursor", "0"))
         except ValueError:
@@ -1644,6 +1747,32 @@ class BrowserObserver:
                 try:
                     browser, cdp, state = await asyncio.wait_for(self.read_state(), 3)
                     target = state["tab_id"]
+                    if not any(queue.include_frames for queue in self.subscribers):
+                        if active is not None:
+                            previous = active[1]
+                            with contextlib.suppress(Exception):
+                                await asyncio.wait_for(
+                                    previous.cdp_client.send.Page.stopScreencast(
+                                        session_id=previous.session_id
+                                    ),
+                                    2,
+                                )
+                            previous.cdp_client._event_registry.unregister(
+                                "Page.screencastFrame"
+                            )
+                        active = None
+                        pending = None
+                        # Video owns its separate capture. State-only viewers must
+                        # neither take JPEGs nor start a competing screencast.
+                        if metadata is None or any(
+                            value != metadata.get(key)
+                            for key, value in state.items()
+                            if key != "sequence"
+                        ):
+                            self.publish("state", state)
+                        metadata = state
+                        await asyncio.sleep(FRAME_INTERVAL)
+                        continue
                     changed = (
                         self._refresh_stream
                         or active is None
@@ -1691,7 +1820,17 @@ class BrowserObserver:
                                 ),
                                 2,
                             )
-                    elif metadata is not None and metadata["title"] != state["title"]:
+                    elif metadata is not None and any(
+                        metadata.get(key) != state.get(key)
+                        for key in (
+                            *IDENTITY_FIELDS,
+                            "title",
+                            "coordinate_ready",
+                            "applied_input_id",
+                            "control_mode",
+                            "execution_state",
+                        )
+                    ):
                         self.publish("state", state)
                     metadata = state
                     event, pending = pending, None
@@ -1823,6 +1962,10 @@ class BrowserObserver:
         self.control_epoch += 1
         with contextlib.suppress(Exception):
             await self.release_keys()
+        if self.media is not None:
+            await self.media.close()
+        if self.frame_records is not None:
+            self.frame_records.clear()
         if self._human_expiry is not None:
             self._human_expiry.cancel()
         for queue in self.subscribers:
