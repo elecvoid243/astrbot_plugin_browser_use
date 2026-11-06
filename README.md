@@ -29,6 +29,12 @@
 
 前端打包命令还会输出 `*-backend-source.zip` 和校验文件，提供匹配后端源码；该源码包需要已有的兼容 AstrBot Python 环境，不携带宿主全部依赖。将旧 data 目录独立保留，在新代码位置通过 `ASTRBOT_ROOT` 指向其父目录，再选择配套前端。离线插件安装不执行 pip 或浏览器下载。
 
+## 私有运行时清单
+
+0.4.0 完整包包含固定的 aiortc 1.14.0、PyAV 16.0.1 和软件 VP8 编码依赖。`runtime/requirements.lock` 锁定所有 Windows x64 wheel 及 SHA256；`scripts/runtime-win-x64.json` 固定 Python、Chromium 和 pip 归档。构建校验原始归档后从 wheelhouse 以 `--no-index --require-hashes` 安装，不借用现有运行目录的包。
+
+`runtime/runtime-check.json` 记录私有依赖、FFmpeg 版本/构建配置/许可证、1920×1080 编码检查及 DLL/PYD 哈希。Python、Chromium 和依赖 wheel 原有许可证与 notices 随包保留；各组件适用自己的上游许可证。用户机器不运行 pip，不把媒体依赖安装到 AstrBot。
+
 ## 有网打包
 
 构建脚本需要 Windows x64 和 Python 3.11+（附带 pip）。它会：
