@@ -19,8 +19,6 @@ from uuid import uuid4
 from aiohttp import web
 from PIL import Image
 
-from browser_capture import IDENTITY_FIELDS
-from frame_records import TARGET_FIELDS, FrameRecords
 from observation_queue import ACTION_LIMIT, ObservationQueue
 
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
@@ -49,14 +47,11 @@ position_revision:window[key].revision};
 class BrowserObserver:
     """Expose a credential-protected loopback bridge in the private runtime."""
 
-    def __init__(self, server, *, coordinate_guard=None, protect_coordinates=False):
+    def __init__(self, server):
         """Attach to the existing MCP server without starting another browser.
 
         Args:
             server: Upstream BrowserUseServer that executes Agent tools.
-            coordinate_guard: Explicit owned guard used by focused regression probes.
-            protect_coordinates: Enable production guard lifecycle and issued-frame
-                validation. This is an internal runtime capability, not a user setting.
         """
         self.server = server
         self.generation = uuid4().hex
@@ -93,11 +88,6 @@ class BrowserObserver:
         self.pending_browser_events = []
         self._snapshot_lock = asyncio.Lock()
         self._snapshot_session = None
-        self.coordinate_guard = coordinate_guard
-        self.protect_coordinates = protect_coordinates
-        self._coordinate_lock = asyncio.Lock()
-        self.frame_records = FrameRecords() if protect_coordinates else None
-        self.media = None
 
     async def start(self) -> None:
         """Bind an ephemeral loopback port and publish its discovery record.
@@ -114,13 +104,6 @@ class BrowserObserver:
         app.router.add_post("/control", self.control)
         app.router.add_post("/manual", self.manual)
         app.router.add_post("/viewport", self.viewport)
-        if self.protect_coordinates:
-            from browser_media import BrowserMedia
-
-            self.media = BrowserMedia(self)
-            app.router.add_post("/media/offer", self.media.offer)
-            app.router.add_get("/media/events", self.media.events)
-            app.router.add_post("/media/close", self.media.disconnect)
         self.runner = web.AppRunner(app, access_log=None)
         await self.runner.setup()
         site = web.TCPSite(self.runner, "127.0.0.1", 0)
@@ -132,13 +115,8 @@ class BrowserObserver:
         )
         temporary.replace(self.discovery)
 
-    async def read_state(self, *, coordinates=True, gesture=False):
+    async def read_state(self):
         """Read the actual target metadata without changing focus or DOM indices.
-
-        Args:
-            coordinates: Include the authoritative frame-tree contract. Releases
-                can read only the existing top-level state while a child is unknown.
-            gesture: Revalidate held gesture structure independently of scrolling.
 
         Returns:
             Browser, CDP session and current identity/metadata.
@@ -147,28 +125,6 @@ class BrowserObserver:
             HTTPConflict: The browser switches targets during the read.
         """
         browser = self.server.browser_session
-        if self.protect_coordinates and (
-            (self.coordinate_guard is None and browser is not None)
-            or (
-                self.coordinate_guard is not None
-                and self.coordinate_guard.browser is not browser
-            )
-        ):
-            async with self._coordinate_lock:
-                if (
-                    self.coordinate_guard is not None
-                    and self.coordinate_guard.browser is not browser
-                ):
-                    # Held input belongs to the old browser, even after its server
-                    # reference changes. Never bind its guard to the replacement.
-                    await self.release_keys()
-                    await self.coordinate_guard.close()
-                    self.coordinate_guard = None
-                    self.frame_records.clear()
-                if self.coordinate_guard is None and browser is not None:
-                    from frame_coordinates import FrameCoordinates
-
-                    self.coordinate_guard = FrameCoordinates(browser)
         state = {
             "generation": self.generation,
             "browser_session_id": browser.id if browser else None,
@@ -190,15 +146,7 @@ class BrowserObserver:
             "width": 0,
             "height": 0,
             **self.action_state(browser.id if browser else None),
-            **(self.media.capability if self.media is not None else {}),
         }
-        if self.coordinate_guard is not None or self.protect_coordinates:
-            state.update(
-                coordinate_contract_version=2,
-                coordinate_ready=False,
-                coordinate_token=None,
-                frame_tree_token=None,
-            )
         if browser is None or not browser.agent_focus_target_id:
             return browser, None, state
         target = browser.agent_focus_target_id
@@ -216,18 +164,6 @@ class BrowserObserver:
                 max_size=8192, actual_size=len(state["url"]) + len(state["title"])
             )
         state["tab_id"] = target
-        if self.coordinate_guard is not None:
-            if coordinates and self.coordinate_guard.browser is browser:
-                from frame_coordinates import CoordinateUnavailable
-
-                try:
-                    state.update(
-                        await self.coordinate_guard.sample(target, gesture=gesture)
-                    )
-                except CoordinateUnavailable:
-                    # Keep the lease and last pixels. Unknown geometry authorizes
-                    # neither a new discrete input nor a new validated capture.
-                    pass
         if self.highlight and any(
             self.highlight.get(key) != state.get(key)
             for key in (
@@ -258,28 +194,6 @@ class BrowserObserver:
             HTTPConflict: Input release remains unconfirmed after all attempts.
                 Admission stays paused and failed input is retained for retry or close.
         """
-        if self.coordinate_guard is not None and (self._held_keys or self._held_mouse):
-            # A destroyed OOPIF has no live input widget to release. Confirm this
-            # through the browser target registry, never a delayed detach event.
-            targets = None
-            with contextlib.suppress(Exception):
-                registry = await asyncio.wait_for(
-                    self.coordinate_guard.browser.cdp_client.send.Target.getTargets(),
-                    1,
-                )
-                targets = {target["targetId"] for target in registry["targetInfos"]}
-            if targets is not None:
-                self._held_keys = {
-                    code: held
-                    for code, held in self._held_keys.items()
-                    if held[0].target_id in targets
-                }
-                if (
-                    self._held_mouse is not None
-                    and self._held_mouse[0].target_id not in targets
-                ):
-                    self._held_mouse = None
-                    self._drag_target = None
         keys = list(self._held_keys.items())
         # Releases are independent. Share one bounded deadline even if many targets died.
         releases = [
@@ -443,11 +357,6 @@ class BrowserObserver:
             raise web.HTTPUnauthorized()
         body = await request.json()
         operation = body.get("operation")
-        terminal = (
-            operation == "reset_keys"
-            or (operation == "pointer" and body.get("phase") in {"up", "cancel"})
-            or (operation == "key" and body.get("phase") == "up")
-        )
         agent_observation = ""
         async with self._control_lock:
             browser = self.server.browser_session
@@ -517,11 +426,10 @@ class BrowserObserver:
                     or self.control_epoch != body.get("control_epoch")
                 ):
                     raise web.HTTPConflict(text="Human control expired.")
-                if (
-                    self.control_mode != "human"
-                    and operation not in {"release", "disconnect"}
-                    and not (self.coordinate_guard is not None and terminal)
-                ):
+                if self.control_mode != "human" and operation not in {
+                    "release",
+                    "disconnect",
+                }:
                     raise web.HTTPConflict(text="Browser input is paused.")
                 if operation in {"release", "disconnect"}:
                     self.control_mode = "paused"
@@ -566,117 +474,7 @@ class BrowserObserver:
                         return web.json_response(self.human["last_ack"])
                     if number != self.human["last_input"] + 1:
                         raise web.HTTPConflict(text="Input sequence expired.")
-                    if self.coordinate_guard is not None and terminal:
-                        self.human["last_input"] = number
-                        self.human["last_ack"] = {
-                            "operation": operation,
-                            "input_id": number,
-                            "status": "uncertain",
-                            "control_epoch": self.control_epoch,
-                        }
-                        try:
-                            if (
-                                operation == "reset_keys"
-                                or body.get("phase") == "cancel"
-                            ):
-                                await self.release_keys()
-                            elif (
-                                operation == "pointer" and self._held_mouse is not None
-                            ):
-                                held, x, y = self._held_mouse
-                                ready = None
-                                with contextlib.suppress(Exception):
-                                    ready = await asyncio.wait_for(
-                                        self.coordinate_guard.sample(
-                                            browser.agent_focus_target_id, gesture=True
-                                        ),
-                                        0.75,
-                                    )
-                                if not ready or ready["frame_tree_token"] != (
-                                    self._drag_target or {}
-                                ).get("frame_tree_token"):
-                                    x, y = -1, -1
-                                elif all(
-                                    type(body.get(k)) in (int, float)
-                                    and math.isfinite(body[k])
-                                    for k in ("x", "y")
-                                ):
-                                    _, x, y = await asyncio.wait_for(
-                                        self.coordinate_guard.route(
-                                            body["x"],
-                                            body["y"],
-                                            target=(self._drag_target or {}).get(
-                                                "input_frame"
-                                            ),
-                                        ),
-                                        0.75,
-                                    )
-                                await asyncio.wait_for(
-                                    held.cdp_client.send.Input.dispatchMouseEvent(
-                                        params={
-                                            "type": "mouseReleased",
-                                            "x": x,
-                                            "y": y,
-                                            "button": "left",
-                                            "buttons": 0,
-                                            "clickCount": 1,
-                                        },
-                                        session_id=held.session_id,
-                                    ),
-                                    3,
-                                )
-                                self._held_mouse = None
-                                self._drag_target = None
-                            elif (
-                                operation == "key"
-                                and body.get("code") in self._held_keys
-                            ):
-                                code = body["code"]
-                                held, params = self._held_keys[code]
-                                await asyncio.wait_for(
-                                    held.cdp_client.send.Input.dispatchKeyEvent(
-                                        params={
-                                            **params,
-                                            "type": "keyUp",
-                                            "text": "",
-                                            "unmodifiedText": "",
-                                            "autoRepeat": False,
-                                        },
-                                        session_id=held.session_id,
-                                    ),
-                                    3,
-                                )
-                                self._held_keys.pop(code, None)
-                        except Exception:
-                            try:
-                                await self.release_keys()
-                            except Exception:
-                                self.control_mode = "paused"
-                                return web.json_response(self.human["last_ack"])
-                        if (
-                            self.execution_state == "active"
-                            and not self._held_keys
-                            and self._held_mouse is None
-                        ):
-                            self.control_mode = "human"
-                        self.applied_input_id = number
-                        self.human["last_ack"] = {
-                            "operation": operation,
-                            "input_id": number,
-                            "status": "applied",
-                            "control_epoch": self.control_epoch,
-                        }
-                        return web.json_response(self.human["last_ack"])
-                    if (
-                        self.coordinate_guard is not None
-                        and operation == "pointer"
-                        and body.get("phase") == "move"
-                    ):
-                        _, cdp, state = await asyncio.wait_for(
-                            self.read_state(gesture=True), 3
-                        )
-                    else:
-                        _, cdp, state = await asyncio.wait_for(self.read_state(), 3)
+                    _, cdp, state = await asyncio.wait_for(self.read_state(), 3)
                     target = body.get("target", {})
                     phase = body.get("phase")
                     if operation == "pointer" and phase not in {
@@ -713,53 +511,11 @@ class BrowserObserver:
                         "viewport_width",
                         "viewport_height",
                     )
-                    coordinate_stale = False
-                    if self.coordinate_guard is not None and not terminal:
-                        coordinate_stale = not (
-                            state.get("gesture_ready")
-                            if continuation
-                            else state.get("coordinate_ready")
-                        )
-                        if continuation:
-                            coordinate_stale = (
-                                coordinate_stale
-                                or not drag_target
-                                or state.get("frame_tree_token")
-                                != drag_target.get("frame_tree_token")
-                                or target.get("coordinate_token")
-                                != drag_target.get("coordinate_token")
-                            )
-                        else:
-                            coordinate_stale = (
-                                coordinate_stale
-                                or not target.get("coordinate_token")
-                                or target.get("coordinate_token")
-                                != state.get("coordinate_token")
-                            )
-                        if self.frame_records is not None:
-                            if continuation:
-                                coordinate_stale = coordinate_stale or any(
-                                    target.get(key) != (drag_target or {}).get(key)
-                                    for key in TARGET_FIELDS
-                                )
-                            else:
-                                coordinate_stale = (
-                                    coordinate_stale
-                                    or not self.frame_records.matches(target, state)
-                                    or (
-                                        target.get("media_session_id") is not None
-                                        and (
-                                            self.media is None
-                                            or not self.media.accepts(target)
-                                        )
-                                    )
-                                )
                     if (
                         operation != "reset_keys"
                         and not (operation == "pointer" and phase == "cancel")
                         and (
-                            coordinate_stale
-                            or cdp is None
+                            cdp is None
                             or (
                                 continuation
                                 and (
@@ -767,11 +523,7 @@ class BrowserObserver:
                                         target.get(key) != drag_target.get(key)
                                         for key in target_fields
                                     )
-                                    or (
-                                        self.coordinate_guard is None
-                                        and self._held_mouse[0].session_id
-                                        != cdp.session_id
-                                    )
+                                    or self._held_mouse[0].session_id != cdp.session_id
                                 )
                             )
                             or (
@@ -801,7 +553,6 @@ class BrowserObserver:
                         self.publish("state", state)
                         return web.json_response(self.human["last_ack"])
                     params = None
-                    routed_target = state.get("tab_id")
                     if operation in {"click", "wheel", "pointer"} and not (
                         operation == "pointer" and phase == "cancel"
                     ):
@@ -901,66 +652,6 @@ class BrowserObserver:
                             params.update(
                                 type="keyDown", text="\r", unmodifiedText="\r"
                             )
-                    if self.coordinate_guard is not None and operation in {
-                        "click",
-                        "wheel",
-                        "pointer",
-                        "key",
-                        "text",
-                    }:
-                        from frame_coordinates import CoordinateUnavailable
-
-                        deadline = time.monotonic() + 1
-                        try:
-                            if operation in {"key", "text"}:
-                                routed = self.coordinate_guard.route()
-                            else:
-                                routed = self.coordinate_guard.route(
-                                    x,
-                                    y,
-                                    target=(drag_target or {}).get("input_frame")
-                                    if continuation
-                                    else None,
-                                )
-                            routed_target, routed_x, routed_y = await asyncio.wait_for(
-                                routed, 1
-                            )
-                            cdp = await asyncio.wait_for(
-                                browser.get_or_create_cdp_session(
-                                    target_id=routed_target, focus=False
-                                ),
-                                max(0, deadline - time.monotonic()),
-                            )
-                            if operation not in {"key", "text"}:
-                                x, y = routed_x, routed_y
-                        except (
-                            CoordinateUnavailable,
-                            asyncio.TimeoutError,
-                            ValueError,
-                        ):
-                            # A cancelled read cannot later continue into dispatch.
-                            # Keep the independently owned input sessions for release.
-                            with contextlib.suppress(Exception):
-                                await asyncio.wait_for(self.coordinate_guard.close(), 1)
-                            state = {
-                                **state,
-                                "coordinate_ready": False,
-                                "coordinate_token": None,
-                            }
-                            self.human["last_input"] = number
-                            self.human["last_ack"] = {
-                                "operation": operation,
-                                "input_id": number,
-                                "status": "stale",
-                                "control_epoch": self.control_epoch,
-                                "state": state,
-                            }
-                            try:
-                                await self.release_keys()
-                            except web.HTTPConflict:
-                                self.human["last_ack"]["status"] = "uncertain"
-                            self.publish("state", state)
-                            return web.json_response(self.human["last_ack"])
                     # Consume before dispatch: an uncertain CDP response must never
                     # cause a retry to click twice.
                     self.human["last_input"] = number
@@ -980,19 +671,6 @@ class BrowserObserver:
                                     self._drag_target = {
                                         key: state.get(key) for key in target_fields
                                     }
-                                    if self.coordinate_guard is not None:
-                                        self._drag_target.update(
-                                            coordinate_token=state["coordinate_token"],
-                                            frame_tree_token=state["frame_tree_token"],
-                                            input_frame=routed_target,
-                                        )
-                                    if self.frame_records is not None:
-                                        self._drag_target.update(
-                                            {
-                                                key: target.get(key)
-                                                for key in TARGET_FIELDS
-                                            }
-                                        )
                                 await asyncio.wait_for(
                                     cdp.cdp_client.send.Input.dispatchMouseEvent(
                                         params={
@@ -1382,8 +1060,6 @@ class BrowserObserver:
             HTTPRequestEntityTooLarge: The encoded image exceeds the bridge budget.
         """
         state = dict(state)
-        if self.coordinate_guard is not None and not state.get("coordinate_ready"):
-            raise web.HTTPConflict(text="Frame coordinates are not ready.")
         captured_at = time.time()
         async with self._snapshot_lock:
             if (
@@ -1416,19 +1092,6 @@ class BrowserObserver:
                     )
                     cached = (browser, state["tab_id"], client, attached["sessionId"])
                     self._snapshot_session = cached
-                if self.protect_coordinates:
-                    # A new document can precede its first compositor pixels.
-                    # Keep the same paint barrier for production JPEG recovery.
-                    await asyncio.wait_for(
-                        cached[2].send.Runtime.evaluate(
-                            params={
-                                "expression": "new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve(true))))",
-                                "awaitPromise": True,
-                            },
-                            session_id=cached[3],
-                        ),
-                        2,
-                    )
                 shot = await cached[2].send.Page.captureScreenshot(
                     params={
                         "format": "jpeg",
@@ -1471,20 +1134,6 @@ class BrowserObserver:
         }
         if after_state != expected:
             raise web.HTTPConflict(text="Page changed; refresh observation.")
-        if self.coordinate_guard is not None:
-            from frame_coordinates import CoordinateUnavailable
-
-            try:
-                checked = await self.coordinate_guard.sample(state["tab_id"])
-            except CoordinateUnavailable as exc:
-                raise web.HTTPConflict(
-                    text="Frame coordinates changed during capture."
-                ) from exc
-            if any(
-                checked[key] != state.get(key)
-                for key in ("coordinate_token", "coordinate_event_revision")
-            ):
-                raise web.HTTPConflict(text="Frame coordinates changed during capture.")
         raw = base64.b64decode(shot["data"])
         with Image.open(io.BytesIO(raw)) as picture:
             if picture.width > MAX_FRAME_WIDTH or picture.height > MAX_FRAME_HEIGHT:
@@ -1517,8 +1166,6 @@ class BrowserObserver:
             or browser.agent_focus_target_id != state["tab_id"]
         ):
             raise web.HTTPConflict(text="Browser target changed; refresh observation.")
-        if self.frame_records is not None:
-            state["frame_id"] = self.frame_records.add(state)["frame_id"]
         return state
 
     async def observe(self, request: web.Request) -> web.Response:
@@ -1552,15 +1199,6 @@ class BrowserObserver:
                     "drag_input_version": 1,
                     "viewport_resize_version": 1,
                     "applied_input_id": self.applied_input_id,
-                    **(self.media.capability if self.media is not None else {}),
-                    **(
-                        {
-                            "coordinate_contract_version": 2,
-                            "frame_provenance_version": 1,
-                        }
-                        if self.protect_coordinates
-                        else {}
-                    ),
                 },
                 headers={"Cache-Control": "no-store"},
             )
@@ -1569,22 +1207,7 @@ class BrowserObserver:
             return web.json_response(state, headers={"Cache-Control": "no-store"})
         target = state["tab_id"]
         if request.path == "/snapshot":
-            for attempt in range(3 if self.protect_coordinates else 1):
-                try:
-                    state = await asyncio.wait_for(
-                        self.capture_snapshot(browser, cdp, state), 3
-                    )
-                    break
-                except web.HTTPConflict:
-                    if attempt == 2 or not self.protect_coordinates:
-                        raise
-                    previous = browser
-                    browser, cdp, state = await self.read_state()
-                    if browser is not previous or cdp is None:
-                        raise web.HTTPConflict(
-                            text="Browser changed during snapshot recovery."
-                        ) from None
-                    target = state["tab_id"]
+            state = await self.capture_snapshot(browser, cdp, state)
             self.sequence += 1
             state["sequence"] = self.sequence
         # A concurrent tab switch must never label an old image as the new page.
@@ -1614,9 +1237,7 @@ class BrowserObserver:
         browser, _, state = await self.read_state()
         if browser is None or request.query.get("browser_session_id") != browser.id:
             raise web.HTTPConflict(text="Browser session expired.")
-        if request.query.get("frames", "1") not in {"0", "1"}:
-            raise web.HTTPBadRequest(text="Invalid frame subscription.")
-        queue = ObservationQueue(include_frames=request.query.get("frames") != "0")
+        queue = ObservationQueue()
         try:
             cursor = int(request.query.get("action_cursor", "0"))
         except ValueError:
@@ -1747,32 +1368,6 @@ class BrowserObserver:
                 try:
                     browser, cdp, state = await asyncio.wait_for(self.read_state(), 3)
                     target = state["tab_id"]
-                    if not any(queue.include_frames for queue in self.subscribers):
-                        if active is not None:
-                            previous = active[1]
-                            with contextlib.suppress(Exception):
-                                await asyncio.wait_for(
-                                    previous.cdp_client.send.Page.stopScreencast(
-                                        session_id=previous.session_id
-                                    ),
-                                    2,
-                                )
-                            previous.cdp_client._event_registry.unregister(
-                                "Page.screencastFrame"
-                            )
-                        active = None
-                        pending = None
-                        # Video owns its separate capture. State-only viewers must
-                        # neither take JPEGs nor start a competing screencast.
-                        if metadata is None or any(
-                            value != metadata.get(key)
-                            for key, value in state.items()
-                            if key != "sequence"
-                        ):
-                            self.publish("state", state)
-                        metadata = state
-                        await asyncio.sleep(FRAME_INTERVAL)
-                        continue
                     changed = (
                         self._refresh_stream
                         or active is None
@@ -1820,17 +1415,7 @@ class BrowserObserver:
                                 ),
                                 2,
                             )
-                    elif metadata is not None and any(
-                        metadata.get(key) != state.get(key)
-                        for key in (
-                            *IDENTITY_FIELDS,
-                            "title",
-                            "coordinate_ready",
-                            "applied_input_id",
-                            "control_mode",
-                            "execution_state",
-                        )
-                    ):
+                    elif metadata is not None and metadata["title"] != state["title"]:
                         self.publish("state", state)
                     metadata = state
                     event, pending = pending, None
@@ -1962,10 +1547,6 @@ class BrowserObserver:
         self.control_epoch += 1
         with contextlib.suppress(Exception):
             await self.release_keys()
-        if self.media is not None:
-            await self.media.close()
-        if self.frame_records is not None:
-            self.frame_records.clear()
         if self._human_expiry is not None:
             self._human_expiry.cancel()
         for queue in self.subscribers:
@@ -1978,8 +1559,6 @@ class BrowserObserver:
             await self.runner.cleanup()
         async with self._snapshot_lock:
             await self._close_snapshot_session()
-        if self.coordinate_guard is not None:
-            await self.coordinate_guard.close()
         if self.discovery.exists():
             record = json.loads(self.discovery.read_text(encoding="utf-8"))
             if record.get("generation") == self.generation:

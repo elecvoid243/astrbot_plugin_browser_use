@@ -338,16 +338,6 @@ def main() -> None:
                     flush=True,
                 )
             finally:
-                if sys.exc_info()[0] is not None:
-                    error_log.flush()
-                    diagnostics = (data_dir / "stderr.log").read_text(
-                        encoding="utf-8", errors="replace"
-                    )
-                    print(
-                        diagnostics[-12000:].replace(token, "<REDACTED>"),
-                        file=sys.stderr,
-                        flush=True,
-                    )
                 if process.poll() is None and bridge_file.is_file():
                     try:
                         bridge = json.loads(bridge_file.read_text(encoding="utf-8"))

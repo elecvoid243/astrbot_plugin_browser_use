@@ -34,14 +34,6 @@ if (-not $destinationPath.StartsWith($pluginsPath.TrimEnd('\', '/') + [System.IO
 if (Test-Path -LiteralPath $destinationPath) {
     throw 'The plugin directory already exists. Stop AstrBot and move the old plugin out of the plugins folder before installing this package. Persistent data is stored separately under plugin_data.'
 }
-# Windows native loaders can reject long DLL paths even when file copies succeed.
-foreach ($nativeFile in Get-ChildItem -LiteralPath (Join-Path $sourcePath 'runtime') -Recurse -File) {
-    if ($nativeFile.Extension -notin @('.dll', '.pyd', '.exe')) { continue }
-    $relativeNative = $nativeFile.FullName.Substring($sourcePath.Length).TrimStart('\', '/')
-    if ((Join-Path $destinationPath $relativeNative).Length -ge 260) {
-        throw 'The installation path is too long for bundled native libraries. Select a shorter AstrBot data directory.'
-    }
-}
 Copy-Item -LiteralPath $sourcePath -Destination $pluginsPath -Recurse
 Write-Host "Installed: $destinationPath"
 Write-Host 'Start AstrBot. Use the plugin switch in the dashboard to start or stop Browser Use MCP.'

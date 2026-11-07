@@ -414,7 +414,7 @@ async def main() -> None:
     """
     server = LocalBrowserServer()
     observer = (
-        BrowserObserver(server, protect_coordinates=True)
+        BrowserObserver(server)
         if os.environ.get("ASTRBOT_BROWSER_BRIDGE_TOKEN")
         else None
     )

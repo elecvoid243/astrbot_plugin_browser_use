@@ -13,7 +13,7 @@
 
 ## 用户安装：Windows x64 离线完整包
 
-1. 在有网的 Windows x64 机器按下方步骤构建，生成 `dist/astrbot_plugin_browser_use-0.4.0-win-x64.zip` 和 SHA256 文件，同时携带匹配的 AstrBot 后端与 Dashboard 发行构建。
+1. 在有网的 Windows x64 机器按下方步骤构建，生成 `dist/astrbot_plugin_browser_use-0.3.0-win-x64.zip` 和 SHA256 文件，同时携带匹配的 AstrBot 后端与 Dashboard 发行构建。
 2. 将 ZIP 复制到无外网机器，解压到任意目录，停止 AstrBot。
 3. 双击解压目录中的 `install.cmd`，选择实际的 AstrBot **data 目录**（其中已有 `plugins` 文件夹）。也可运行 `install.cmd -AstrBotDataDir "D:/AstrBot/data"`。
 4. 启动 AstrBot，插件将自动加载并连接 MCP。插件配置中的 Python、浏览器路径留空即可使用随包环境。
@@ -28,16 +28,6 @@
 **Agent 浏览器还要求 AstrBot_for_spzx 包含 #86 的宿主和 Dashboard 变更。版本号 4.28.1 本身不足以证明兼容。** 核对完整包 `runtime/manifest.json` 中的 `astrbot_revision` 与 `dashboard_sha256`；前端 ZIP 的 `dist/assets/browser-observer-build.json` 记录匹配的后端提交。插件 ZIP 只安装插件，不升级后端或 Dashboard。停止 AstrBot 后另行部署匹配后端，并将 Dashboard ZIP 解压，使用 `python main.py --webui-dir "D:/matching-dashboard/dist"` 启动。不要将前端 ZIP 当作插件上传，也不要覆盖生产数据。先在临时数据目录验收。
 
 前端打包命令还会输出 `*-backend-source.zip` 和校验文件，提供匹配后端源码；该源码包需要已有的兼容 AstrBot Python 环境，不携带宿主全部依赖。将旧 data 目录独立保留，在新代码位置通过 `ASTRBOT_ROOT` 指向其父目录，再选择配套前端。离线插件安装不执行 pip 或浏览器下载。
-
-## 私有运行时清单
-
-0.4.0 完整包包含固定的 aiortc 1.14.0、PyAV 16.0.1 和软件 VP8 编码依赖。`runtime/requirements.lock` 锁定所有 Windows x64 wheel 及 SHA256；`scripts/runtime-win-x64.json` 固定 Python、Chromium 和 pip 归档。构建校验原始归档后从 wheelhouse 以 `--no-index --require-hashes` 安装，不借用现有运行目录的包。
-
-安装路径支持中文和空格；请选择较短的 data 路径。Windows 原生 DLL 加载器可能拒绝过长的完整路径，安装器会在复制前检查并提示改用较短路径。升级时先停用插件，把旧目录移出 `plugins`，再运行安装器；不要移动或覆盖单独的 `plugin_data`。
-
-`runtime/runtime-check.json` 记录私有依赖、FFmpeg 版本/构建配置/许可证、1920×1080 编码检查及 DLL/PYD 哈希。Python、Chromium 和依赖 wheel 原有许可证与 notices 随包保留；各组件适用自己的上游许可证。用户机器不运行 pip，不把媒体依赖安装到 AstrBot。
-
-`scripts/licenses` 另附 FFmpeg 的 GPL/LGPL 文本及 PyAV 16.0.1 所用的 8.0-2 原生构建来源和源码 SHA256。该上游构建补丁修改了 x264/x265 的许可证分类；DLL 自报 LGPLv3 不能代替这些独立组件的许可证。分发时应一并保留来源、补丁记录、许可证及 wheel notices，不能把整个原生依赖树标为 BSD。
 
 ## 有网打包
 
@@ -65,14 +55,14 @@ python scripts/build_offline.py --source-only
 
 下载缓存在 `.build/downloads`，构建临时环境使用后自动清理。ZIP 中保留 `runtime/requirements.lock`、`runtime/manifest.json`、Python/浏览器及依赖包携带的许可文件。分发前应检查这些组件的再分发许可。
 
-`manifest.json` 包含插件、Python、pip、Browser Use、Chromium 版本、源码哈希、构建输入及来源和匹配前端校验值。校验外层 ZIP：`Get-FileHash .\dist\astrbot_plugin_browser_use-0.4.0-win-x64.zip -Algorithm SHA256`，与 `.zip.sha256` 对照。移动插件安装目录后，留空默认路径会在下次启用时重新定位；安装器仍拒绝覆盖已有插件，`plugin_data` 中的数据保留，但不同浏览器会话使用新 profile。
+`manifest.json` 包含插件、Python、pip、Browser Use、Chromium 版本、源码哈希、构建输入及来源和匹配前端校验值。校验外层 ZIP：`Get-FileHash .\dist\astrbot_plugin_browser_use-0.3.0-win-x64.zip -Algorithm SHA256`，与 `.zip.sha256` 对照。移动插件安装目录后，留空默认路径会在下次启用时重新定位；安装器仍拒绝覆盖已有插件，`plugin_data` 中的数据保留，但不同浏览器会话使用新 profile。
 
 ## 完整宿主验收与故障排查
 
 在具有 AstrBot 开发依赖、`aiohttp playwright psutil` 的测试解释器运行匹配后端仓库中的脚本。它从最终 ZIP 安装到新建的中文/空格目录，启动真实 AstrBot、SQLite、登录、插件管理、完整 Chat.vue 和 Agent 工具执行；仅以本地 OpenAI 兼容 fixture 代替模型服务。本机复用随包 Chromium，不下载测试浏览器。`--evidence-dir` 必须尚不存在。
 
 ```powershell
-python scripts/browser_observer_acceptance.py --plugin-zip D:/delivery/astrbot_plugin_browser_use-0.4.0-win-x64.zip --dashboard-dir D:/delivery/dist --evidence-dir D:/temporary/new-acceptance
+python scripts/browser_observer_acceptance.py --plugin-zip D:/delivery/astrbot_plugin_browser_use-0.3.0-win-x64.zip --dashboard-dir D:/delivery/dist --evidence-dir D:/temporary/new-acceptance
 ```
 
 该命令在 **AstrBot 仓库** 执行，生成截图、宿主日志、模型请求和逐项结果。测试为宿主进程注入临时的外部 DNS/套接字拦截，并设置失效的外网 HTTP 代理，网页/模型均使用回环；这是模拟无外网，不等于系统防火墙或断开网络的干净目标机。被拒绝的更新查询可能出现在日志中。实际无网 Windows 目标机和真实 vLLM 工具调用仍需分别验收。不要把模型 fixture 成功当作特定 vLLM 模型兼容证明。
@@ -85,18 +75,6 @@ python scripts/browser_observer_acceptance.py --plugin-zip D:/delivery/astrbot_p
 - 离线启动失败：勿执行 pip 修补宿主环境；核对 SHA256、安装路径及安全设置是否放行私有 Python，保留日志后在有网构建机重建完整包。
 
 ## 源码开发或复用现成环境
-
-配套的新版宿主和 Dashboard 可协商本地 WebRTC 视频；私有 Python 需具备已验证的
-aiortc `1.14.0`、PyAV `16.0.1` 与 libvpx。缺少依赖或接收端帧元数据能力时保留 JPEG，
-不要把这些库安装进 AstrBot 的 Python。源码的视频支持不代表现有离线 ZIP 已包含这些依赖；
-应以最终包的锁文件、清单和安装验收为准。
-
-视频与人工输入分离，使用原有接管租约和有序输入 WebSocket。媒体票据仅由宿主为当前账号
-拥有的聊天签发，双方不配置公网 STUN/TURN。视频故障保留人工所有权，可明确重试或切换
-JPEG。新画面必须带实际呈现帧对应的签发记录与完整坐标 token；缺字段不会降级保护。
-同源、跨源/OOPIF、open/closed shadow 的坐标不明确时暂停新输入，已有松开和重置仍走原
-输入会话；这不承诺任意 DOM/动画语义的原子点击。实际帧率和交互延迟取决于页面、分辨率
-与机器，不能将上限或目标值当作保证。
 
 插件的 `requirements.txt` 没有宿主依赖。不要将 `browser-use` 安装进 AstrBot 的 Python；当前双方对 MCP、psutil、reportlab 的版本要求有冲突。
 
@@ -235,9 +213,9 @@ CDP dispatch, and keep human ownership while the next image synchronizes. The
 client displays the rejection and does not replay that gesture. Other uncertain
 or invalid commands retain the existing fail-closed behavior.
 
-## 0.4.0 人工登录交付
+## 0.3.0 人工登录交付
 
-0.4.0 包含人工接管、键盘/中文提交与粘贴、滚动/双击、显式交还和断连恢复。不能仅比较宿主版本号：Dashboard 的 `browser-observer-build.json` 与插件 `runtime/manifest.json` 必须具有相同 `astrbot_revision` 和 `plugin_revision`；同时核对插件记录的 Dashboard ZIP SHA256。两仓库先提交最终源码，再打包；打包脚本拒绝未提交的受跟踪变更。宿主源码 ZIP 仍要求已有兼容的 AstrBot Python 环境，不是宿主依赖离线安装包。Windows x64 私有 Python/Chromium 随完整插件包提供，其他平台不能使用该二进制包。
+0.3.0 包含人工接管、键盘/中文提交与粘贴、滚动/双击、显式交还和断连恢复。不能仅比较宿主版本号：Dashboard 的 `browser-observer-build.json` 与插件 `runtime/manifest.json` 必须具有相同 `astrbot_revision` 和 `plugin_revision`；同时核对插件记录的 Dashboard ZIP SHA256。两仓库先提交最终源码，再打包；打包脚本拒绝未提交的受跟踪变更。宿主源码 ZIP 仍要求已有兼容的 AstrBot Python 环境，不是宿主依赖离线安装包。Windows x64 私有 Python/Chromium 随完整插件包提供，其他平台不能使用该二进制包。
 
 升级时停止宿主，保存配套旧后端、Dashboard、插件包及校验值，将旧插件目录移出 `data/plugins`，再使用原安装器。不要将旧插件与新插件同时加载；保留 `data/plugin_data`。当前浏览器会话不能跨宿主重启保存；同一任务内人工接管则保留原浏览器和登录态。回退也应停止宿主并整体恢复配套三个组件，保留独立数据备份。
 
@@ -246,7 +224,7 @@ or invalid commands retain the existing fail-closed behavior.
 最终 ZIP 的组合验收在 AstrBot 仓库执行：
 
 ```powershell
-python scripts/browser_manual_control_acceptance.py --plugin-zip D:/delivery/astrbot_plugin_browser_use-0.4.0-win-x64.zip --dashboard-dir D:/delivery/dist --evidence-dir D:/temporary/new-h06 --login-handoff --pointer-input --text-input --lost-key-target --recovery
+python scripts/browser_manual_control_acceptance.py --plugin-zip D:/delivery/astrbot_plugin_browser_use-0.3.0-win-x64.zip --dashboard-dir D:/delivery/dist --evidence-dir D:/temporary/new-h06 --login-handoff --pointer-input --text-input --lost-key-target --recovery
 # For the separate one-step-budget regression, use a new directory and
 # --handoff-boundaries, omitting --login-handoff.
 ```
